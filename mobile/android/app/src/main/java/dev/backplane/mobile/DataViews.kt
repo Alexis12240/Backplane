@@ -950,7 +950,7 @@ private fun SettingsScreen(back: () -> Unit, hub: () -> Unit, accounts: () -> Un
             DLine()
             DMono(Msg.settings_lang.uppercase(), dfaint)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("auto" to Msg.settings_lang_auto, "en" to Msg.settings_lang_en, "ja" to Msg.settings_lang_ja).forEach { (v, l) ->
+                listOf("auto" to Msg.settings_lang_auto, "en" to Msg.settings_lang_en, "ja" to Msg.settings_lang_ja, "es" to Msg.settings_lang_es).forEach { (v, l) ->
                     DBtn(l, AppSettings.lang == v, modifier = Modifier.testTag("settings.lang.$v")) { AppSettings.putLang(v); DataClient.channels() }
                 }
             }
