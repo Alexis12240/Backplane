@@ -1484,7 +1484,8 @@ pub fn strip<V: 'static>(cx: &mut Context<V>, light: bool, pane: &Entity<KicadPa
     row = row.child(div().flex_1());
     let mk = |id: &'static str, label: String, tip: String, a: &'static str, cx: &mut Context<V>| {
         let act = act.clone();
-        div().id(id).px_2().py(px(3.)).text_size(crate::scale::tpx(12.)).border_1().border_color(c("line")).bg(c("raise")).cursor_pointer().hover(|s| s.bg(c("panel")))
+        // its rect under `kicad:<id>` for the e2e drivers (BACKPLANE_GPUI_RECTS), as the pane's own buttons
+        crate::ui::with_rect(div().id(id), move || format!("kicad:{id}")).px_2().py(px(3.)).text_size(crate::scale::tpx(12.)).border_1().border_color(c("line")).bg(c("raise")).cursor_pointer().hover(|s| s.bg(c("panel")))
             .tooltip(crate::keys::tip(&tip, "", light)).child(label)
             .on_click(cx.listener(move |this, _, window, cx| act(this, a, window, cx)))
     };
