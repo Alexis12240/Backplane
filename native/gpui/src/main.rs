@@ -73,6 +73,7 @@ impl Backplane {
         let _=self.tx.try_send(screens::viewer::view_kind(&match part {Some(p)=>format!("{k}\t{p}"),None=>k})); cx.notify();
     }
     pub(crate) fn new(window:&mut Window,cx:&mut Context<Self>,config:hub::Config,started:Instant)->Self {
+        plat::set_window_icons(window);
         let (swatches,gallery,fonts,theme)=(config.swatches,config.gallery,config.fonts,config.theme.clone());let steps:VecDeque<Step>=config.script.as_ref().map(|p|script::load(p)).unwrap_or_default();let script_total=steps.len();
         // a client that never gets projects says so (a hub with a canned presenter, a refused token ...) instead of leaving a script waiting silently
         cx.spawn(async move |weak,cx|{cx.background_executor().timer(Duration::from_secs(10)).await;let _=weak.update(cx,|this,_|{if !this.usable {this.m("not_usable",serde_json::json!({"after_s":10,"status":this.status,"error":this.error,"projects":this.data["projects"].as_array().map_or(0,|p|p.len())}));}});}).detach();
@@ -356,7 +357,7 @@ fn main()->anyhow::Result<()> {
         let opts=WindowOptions{window_bounds:Some(WindowBounds::Windowed(bounds)),titlebar:Some(TitlebarOptions{title:Some("Backplane GPUI · experimental".into()),..Default::default()}),..Default::default()};
         if let Some(spec)=config.solid_demo.clone() { // --solid-demo TRIS|FILE[,STEPS]: the 3D page alone on a synthetic model or a frame file (measurement, check mode)
             let mut it=spec.split(',');let source=it.next().unwrap_or("100000").to_string();let steps=it.next().and_then(|t|t.parse().ok()).unwrap_or(200);
-            cx.open_window(opts,move|_,cx|cx.new(|cx|viewers::demo::Demo::new(cx,&source,steps,started))).unwrap_or_else(window_failed);
+            cx.open_window(opts,move|window,cx|{plat::set_window_icons(window);cx.new(|cx|viewers::demo::Demo::new(cx,&source,steps,started))}).unwrap_or_else(window_failed);
         } else {
             let measure=config.script.is_some();
             if config.pending { // no --url: this device's own hub, or the chooser

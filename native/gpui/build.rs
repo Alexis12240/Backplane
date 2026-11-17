@@ -8,6 +8,16 @@ fn main() {
     if env::var_os("CARGO_FEATURE_CEF").is_some() && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bin=backplane-gpui=/DELAYLOAD:libcef.dll");
     }
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+        let rc = dir.join("resources/windows/backplane.rc");
+        let icons = dir.join("../../assets/icon");
+        println!("cargo:rerun-if-changed={}", rc.display());
+        println!("cargo:rerun-if-changed={}", icons.join("backplane.ico").display());
+        embed_resource::compile_for(rc, &["backplane-gpui"], embed_resource::ParamsIncludeDirs([&icons]))
+            .manifest_required()
+            .unwrap();
+    }
     let css_path=PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../assets/web/style.css");
     println!("cargo:rerun-if-changed={}",css_path.display());
     let css=fs::read_to_string(css_path).unwrap();

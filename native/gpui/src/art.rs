@@ -431,6 +431,15 @@ mod generated_assets_tests {
         assert!(missing.is_empty(), "icons the client names but assets/icons.json lacks: {missing:?}");
         let rigs = std::fs::read_dir(root.join("cat-rigs")).expect("assets/cat-rigs").count(); assert_eq!(rigs, 72 * 8, "a rig for every look and mood");
     }
+
+    #[test] fn the_windows_icon_has_all_standard_sizes() {
+        let ico = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/icon/backplane.ico")).expect("assets/icon/backplane.ico");
+        assert!(ico.len() >= 6 && &ico[0..4] == [0, 0, 1, 0]);
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        assert!(ico.len() >= 6 + count * 16);
+        let sizes: Vec<u32> = (0..count).map(|i| { let e = &ico[6 + i * 16..]; let w = if e[0] == 0 { 256 } else { e[0] as u32 }; assert_eq!(w, if e[1] == 0 { 256 } else { e[1] as u32 }); w }).collect();
+        for want in [16, 20, 24, 32, 48, 64, 128, 256] { assert!(sizes.contains(&want), "backplane.ico missing {want}x{want}: {sizes:?}"); }
+    }
 }
 
 #[cfg(test)]

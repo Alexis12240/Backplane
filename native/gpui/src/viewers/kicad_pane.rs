@@ -2013,6 +2013,7 @@ impl crate::Backplane {
         let opts = WindowOptions { window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1400.), px(900.)), cx))),
             titlebar: Some(TitlebarOptions { title: Some(crate::streamer::shown(&format!("{title} — KiCad · Backplane")).into()), ..Default::default() }), ..Default::default() };
         match cx.open_window(opts, move |window, cx| {
+            crate::plat::set_window_icons(window);
             let app2 = app.clone();
             window.on_window_should_close(cx, move |window, cx| { let popped = top_of(window).unwrap_or(0); if let Some(a) = app2.upgrade() { a.update(cx, |a, cx| a.kicad_popin_closing(popped, cx)); } true });
             cx.new(|_| KicadWindow { pane, app, light })

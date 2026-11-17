@@ -182,3 +182,29 @@ pub fn adopt_app_bundle() {
     if let Some(app) = std::path::Path::new(&p).ancestors().nth(3) { unsafe { std::env::set_var("BACKPLANE_APP", app) } }
     unsafe { std::env::remove_var("CFProcessPath") }
 }
+
+/// Windows: attach both the large (taskbar/Alt-Tab) and small (titlebar) frames of the embedded icon resource so neither falls back to a scaled copy or blank icon.
+pub fn set_window_icons(window: &gpui::Window) {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::{
+            Foundation::HWND,
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON},
+        };
+        let Ok(h) = HasWindowHandle::window_handle(window) else { return };
+        let RawWindowHandle::Win32(w) = h.as_raw() else { return };
+        let hwnd = w.hwnd.get() as isize as HWND;
+        unsafe {
+            let module = GetModuleHandleW(std::ptr::null());
+            if module.is_null() { return }
+            let big = LoadImageW(module, 1 as *const u16, IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), LR_SHARED);
+            if !big.is_null() { SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize); }
+            let small = LoadImageW(module, 1 as *const u16, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+            if !small.is_null() { SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize); }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}

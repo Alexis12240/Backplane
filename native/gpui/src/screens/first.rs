@@ -27,6 +27,7 @@ const GUIDE: &str = "https://github.com/BackplaneWorks/Backplane/blob/main/docs/
 
 impl First {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, config: Config, started: Instant, auto: Option<PathBuf>) -> Self {
+        crate::plat::set_window_icons(window);
         let input = |hint: &str, cx: &mut Context<Self>| { let hint = hint.to_string(); cx.new(move |cx| { let mut c = Composer::with_context(cx, "AskInput"); c.set_placeholder(&hint); c }) };
         let default_home = launch::default_here().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         let path = input("Folder", cx); let addr = input("Pairing link or address", cx); let code = input("Short code", cx);
