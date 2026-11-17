@@ -125,6 +125,7 @@ pub fn spawn(wrap: Option<Vec<String>>, ev: Evidence, mut make: impl FnMut(Optio
     make(None).spawn()
 }
 /// What an exited child wrote to its stderr pipe, and a pipe that gives the same bytes again to whoever reads it next.
+#[cfg(unix)]
 fn take_back(e: tokio::process::ChildStderr) -> (Vec<u8>, Option<tokio::process::ChildStderr>) {
     use std::io::{Read, Write};
     let Ok(fd) = e.into_owned_fd() else { return (vec![], None) };
@@ -138,6 +139,8 @@ fn take_back(e: tokio::process::ChildStderr) -> (Vec<u8>, Option<tokio::process:
     let back = tokio::process::ChildStderr::from_std(std::process::ChildStderr::from(r)).ok();
     (b, back)
 }
+#[cfg(not(unix))]
+fn take_back(_e: tokio::process::ChildStderr) -> (Vec<u8>, Option<tokio::process::ChildStderr>) { (Vec::new(), None) }
 
 /// systemd-run's arguments that start what follows them in a new scope (`what`: "agent" or "work", in its unit's name), or None when scopes are off.
 pub fn wrap(what: &str) -> Option<Vec<String>> {

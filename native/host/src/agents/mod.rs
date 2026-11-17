@@ -1193,8 +1193,9 @@ impl Actor {
         let mut keep = vec![]; // Windows: the files Claude reads at its start, removed when it ends
         if cfg!(windows) {
             let name: String = th.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
-            rules::prompt_to_file(&mut args, &self.ag.host.home.join("prompts").join(format!("{name}.md"))).map_err(|e| e.to_string())?;
-            keep.extend(rules::mcp_to_file(&mut args, &proc::run_dir(&self.ag.host.home), &format!("{name}-{gen}.mcp.json")).map_err(|e| format!("could not write the MCP config for Claude: {e}"))?);
+            let home = if self.ag.host.home.as_os_str().is_empty() { &self.ag.hub.cfg.home } else { &self.ag.host.home };
+            rules::prompt_to_file(&mut args, &home.join("prompts").join(format!("{name}.md"))).map_err(|e| e.to_string())?;
+            keep.extend(rules::mcp_to_file(&mut args, &proc::run_dir(home), &format!("{name}-{gen}.mcp.json")).map_err(|e| format!("could not write the MCP config for Claude: {e}"))?);
         }
         if !acct_args.is_empty() { acct_args.extend(args); args = acct_args }
         if self.person { args.extend(person::CLAUDE_STRICT.iter().map(|x| x.to_string())) } // only this hub's MCP config; the person's user-level hooks, MCP servers and rules do not load

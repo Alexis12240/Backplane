@@ -35,9 +35,9 @@ pub fn files_safe(rel: &str) -> bool { safe(rel) && !rel.contains('\\') && !driv
 
 /// Fm.join / Fm.last / Fm.parent
 pub fn join(dir: &str, name: &str) -> String { if dir.is_empty() { name.to_string() } else { format!("{dir}/{name}") } }
-pub fn last(p: &str) -> &str { p.rsplit('/').next().unwrap_or(p) }
+pub fn last(p: &str) -> &str { p.rsplit(crate::plat::fs::SEPS).next().unwrap_or(p) }
 pub fn parent(dir: &str) -> String {
-    let cut = dir.len() - last(dir).len() - usize::from(dir.contains('/'));
+    let cut = dir.len() - last(dir).len() - usize::from(dir.contains(crate::plat::fs::SEPS));
     dir[..cut].to_string()
 }
 

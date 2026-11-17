@@ -174,7 +174,12 @@ elif "-p" in a:
 async fn a_thread_bound_to_a_named_account_runs_under_that_profiles_own_folder_and_the_default_one_does_not() {
     use crate::plat::fs::PermissionsExt;
     let home = dir("acct-home"); let work = dir("acct-work"); let sd = dir("acct-bin"); let log = sd.join("turns.jsonl");
-    let p = sd.join("claude"); std::fs::write(&p, ACCOUNT_CLAUDE).unwrap(); std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if cfg!(windows) {
+        std::fs::write(sd.join("claude.py"), ACCOUNT_CLAUDE).unwrap();
+        std::fs::write(sd.join("claude.cmd"), "@echo off\r\npython \"%~dp0claude.py\" %*\r\n").unwrap();
+    } else {
+        let p = sd.join("claude"); std::fs::write(&p, ACCOUNT_CLAUDE).unwrap(); std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     std::env::set_var("STANDIN_LOG", &log);
     // the hub runs from a shell whose own Claude ran under a profile (as an agent's Bash does after failover): the default-login thread must not inherit it
     std::env::set_var("CLAUDE_CONFIG_DIR", "/nonexistent/providers/accounts-v1/inherited/store");
@@ -206,7 +211,7 @@ async fn a_thread_bound_to_a_named_account_runs_under_that_profiles_own_folder_a
     let out = turn(T1).await; assert!(out.contains("\"completed\""), "{out}");
     let ran: Vec<Value> = std::fs::read_to_string(&log).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     let d1 = ran[0]["dir"].as_str().unwrap();
-    assert!(d1.contains(&format!("providers/accounts-v1/{id}/")), "the bound thread runs in the profile's own config folder: {d1}");
+    assert!(d1.replace('\\', "/").contains(&format!("providers/accounts-v1/{id}/")), "the bound thread runs in the profile's own config folder: {d1}");
     let args: Vec<&str> = ran[0]["args"].as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
     assert!(args.windows(2).any(|w| w == ["--setting-sources", "user"]) && args.iter().any(|a| a.contains("forceLoginMethod")), "claude.ai login is forced for the profile: {args:?}");
     let out = turn(t2).await; assert!(out.contains("\"completed\""), "{out}");
@@ -215,8 +220,9 @@ async fn a_thread_bound_to_a_named_account_runs_under_that_profiles_own_folder_a
     // a profile whose sign-in moved on is never silently swapped for the default: with no other login it is not swapped at all
     let s = mgr.request(&json!({"op":"disconnect","profile":id})).await; assert_ne!(s["error"], "", "an account a running thread uses cannot be signed out under it");
     assert_eq!(s["profiles"][0]["state"], "connected");
-    ag.stop(T1).await.unwrap(); tokio::time::sleep(Duration::from_millis(300)).await;
-    let s = mgr.request(&json!({"op":"disconnect","profile":id})).await; assert_eq!(s["error"], "", "{s}");
+    ag.stop(T1).await.unwrap();
+    let s = async { for _ in 0..40 { let s = mgr.request(&json!({"op":"disconnect","profile":id})).await; if !s["error"].as_str().unwrap_or("").contains("already running") { return s } tokio::time::sleep(Duration::from_millis(100)).await } mgr.request(&json!({"op":"disconnect","profile":id})).await }.await;
+    assert_eq!(s["error"], "", "{s}");
     // with no other account and the CLI's own login not signed in there is no route: it waits and tries again by itself (agents `account_retry`) and ends with the reason,
     // or, as the account's change reaches the watch first, is stopped with what to do (accounts_hub `retired`)
     let out = turn(T1).await; assert!(out.contains("Reconnect and select this account") && out.contains("Trying again in"), "no route to any login: {out}");

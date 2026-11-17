@@ -62,7 +62,7 @@ async fn bot(hub: &Arc<Hub>, name: &str) -> String {
     assert!(log(&hub).iter().any(|e| e["$"] == "WorktreeSet"), "the folder is made before the reply: a message sent at once to a new bot has somewhere to run");
     until(&hub, |l| l.iter().any(|e| e["$"] == "WorktreeSet")).await;
     let w = log(&hub).into_iter().find(|e| e["$"] == "WorktreeSet").unwrap();
-    assert_eq!(w["id"], ev[0]["id"]); assert!(w["worktree"].as_str().unwrap().ends_with(&format!("/bots/{b}")));
+    assert_eq!(w["id"], ev[0]["id"]); assert!(w["worktree"].as_str().unwrap().replace('\\', "/").ends_with(&format!("/bots/{b}")));
     let taken = rpc(&hub, "bots.create", json!({"name":"ADA"})).await; assert_eq!(taken["error"], "a bot named ADA already exists");
     for bad in ["", "a b", &"x".repeat(25), "é"] { assert_eq!(rpc(&hub, "bots.create", json!({"name":bad})).await["error"], "a bot's name is 1 to 24 letters, digits, - or _", "{bad:?}") }
 }
@@ -311,8 +311,13 @@ fn norm(ev: &[Value]) -> Vec<String> {
         let mut e = e.clone();
         if e["$"] == "BotSet" { if let Some(o) = e.as_object_mut() { o.remove("auto"); o.remove("color"); if let Some(l) = o.get("look").and_then(Value::as_u64) { o.insert("look".into(), json!(l % 72)); } } }
         if e["$"] == "UberOp" { if let Ok(mut op) = serde_json::from_str::<Value>(e["op"].as_str().unwrap_or("")) { if op["k"] == "who" { if let Some(l) = op["look"].as_u64() { op["look"] = json!(l % 72); e["op"] = json!(op.to_string()); } } } }
+        if e["$"] == "WorktreeSet" {
+            if let Some(wt) = e.get("worktree").and_then(Value::as_str) {
+                let wt = wt.replace('\\', "/");
+                if let Some(i) = wt.rfind("/bots/") { e["worktree"] = json!(format!("<home>{}", &wt[i..])); }
+            }
+        }
         let s = serde_json::to_string(&e).unwrap();
-        let s = match s.rfind("/bots/") { Some(i) if s[..i].contains("\"worktree\":\"") => { let a = s.rfind("\"worktree\":\"").unwrap() + 12; format!("{}<home>{}", &s[..a], &s[i..]) } _ => s };
         let cs: Vec<char> = s.chars().collect(); let mut out = String::new(); let mut i = 0;
         while i < cs.len() {
             let c = cs[i];
@@ -1312,7 +1317,10 @@ fn stored(e: &Value) -> Value {
         let raw = c["result"]["content"][0]["text"].as_str().unwrap();
         let want: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!(raw));
         assert_eq!(c["result"]["isError"].as_bool().unwrap(), !ok, "{name} {args}: {body}");
-        let got: Value = serde_json::from_str(&body.to_string().replace(&w, "/tmp/bp-rec-work")).unwrap();
+        let wf = w.replace('\\', "/"); let wj = w.replace('\\', "\\\\");
+        let wt = format!("/tmp/{}", work.file_name().unwrap().to_string_lossy());
+        let unwork = |s: String| s.replace(&wj, "/tmp/bp-rec-work").replace(&wf, "/tmp/bp-rec-work").replace(&w, "/tmp/bp-rec-work").replace(&wt, "/tmp/bp-rec-work");
+        let got: Value = serde_json::from_str(&unwork(body.to_string())).unwrap();
         // Push.gate: the JS hub let any bot reach the phone; here only the uberbot does, and this recording has none
         let mut want = want; if name == "notify_person" && want["note"] == "sent to the person" { want["note"] = json!(DESK_ONLY) }
         assert_eq!(scrubbed(&got), scrubbed(&want), "{name} {args}");
@@ -1320,7 +1328,7 @@ fn stored(e: &Value) -> Value {
         // what the call left in the log; a mark an alert gets is the state lane's (no Transform on this hub)
         let mine: Vec<Value> = log(&hub)[at..].iter().filter(|e| tool_line(e)).map(stored).collect();
         let theirs: Vec<Value> = js[pre.max(done)..post].iter().filter(|e| tool_line(e) && !(["notify_person", "project_create"].contains(&name) && e["key"].as_str().map_or(false, |k| k.starts_with("told.") || k.starts_with("alert.") && name == "project_create"))).map(stored).collect();
-        let mine: Vec<Value> = serde_json::from_str(&serde_json::to_string(&mine).unwrap().replace(&w, "/tmp/bp-rec-work")).unwrap();
+        let mine: Vec<Value> = serde_json::from_str(&unwork(serde_json::to_string(&mine).unwrap())).unwrap();
         assert_eq!(mine, theirs, "{name} {args}");
         // the rest of what happened meanwhile (an ask closing, a turn) is the hub's, and comes from the recording
         let rest: Vec<Value> = js[pre.max(done)..post].iter().filter(|e| !tool_line(e)).cloned().collect(); hub.commit_many(&rest).await.unwrap(); done = post.max(done);
