@@ -399,7 +399,12 @@ mod tests {
     #[test] fn the_language_in_force_decides_what_tr_returns() {
         assert_eq!(tr("Theme"), "Theme", "English is untouched");
         with_lang("ja", || { assert_eq!(tr("Theme"), "テーマ"); assert_eq!(trs("Open"), "開く"); assert_eq!(tr("a title nobody catalogued"), "a title nobody catalogued"); assert_eq!(tf("gpui.keys.fixed", &[("key", "Esc".into())]), "Esc。固定です。"); assert_eq!(tr("264 px."), "264 pxです。"); });
-        with_lang("es", || { assert_eq!(tr("Theme"), "Tema"); assert_eq!(trs("Open"), "Abrir"); assert_eq!(tr("1 thread"), "1 hilo"); assert_eq!(tr("12 threads"), "12 hilos"); });
+        with_lang("es", || {
+            assert_eq!(tr("Theme"), "Tema"); assert_eq!(trs("Open"), "Abrir"); assert_eq!(tr("1 thread"), "1 hilo"); assert_eq!(tr("12 threads"), "12 hilos");
+            assert_eq!(trs("Default model"), "Modelo por defecto");
+            assert_eq!(trs("antigravity does not report its context."), "antigravity no reporta su contexto.");
+            assert_eq!(trs("Pick another model or agent for this thread"), "Elige otro modelo o agente para este hilo");
+        });
         assert_eq!(tf("gpui.keys.fixed", &[("key", "Esc".into())]), "Esc. Fixed.");
         with_lang("en", || assert_eq!(tr("Theme"), "Theme"));
     }
