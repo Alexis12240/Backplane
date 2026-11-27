@@ -895,11 +895,12 @@ impl Render for Backplane {
         // the 3D pages' background follows the setting and the theme, live
         for page in self.screens.retired_solids.drain(..) { page.update(cx, |p, _| p.release(window)); }
         let back = self.local.viewer_backdrop(self.light()); back.make_current();
-        if let Some(s) = self.screens.active_solid().cloned() { let (part, split) = (crate::screens::plotview::probed_part(self), self.data["thread"]["viewer"]["open"] == "split"); s.update(cx, |p, _| { p.set_backdrop(back); p.set_probe(&part); p.names_probe = !split; }); }
+        let renderer = self.local.renderer_mode(); renderer.make_current();
+        if let Some(s) = self.screens.active_solid().cloned() { let (part, split) = (crate::screens::plotview::probed_part(self), self.data["thread"]["viewer"]["open"] == "split"); s.update(cx, |p, _| { p.set_backdrop(back); p.set_renderer(renderer); p.set_probe(&part); p.names_probe = !split; }); }
         if crate::screens::viewer::is_tiled(&self.data["thread"]["viewer"]) {
             let part = crate::screens::plotview::probed_part(self);
             for page in self.screens.tile_solids() {
-                page.update(cx, |p, _| { p.set_backdrop(back); p.set_probe(&part); p.collect(window); });
+                page.update(cx, |p, _| { p.set_backdrop(back); p.set_renderer(renderer); p.set_probe(&part); p.collect(window); });
             }
         }
         for (slot, page) in &self.screens.solids {

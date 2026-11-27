@@ -17,5 +17,5 @@ pub mod kicad_pane;
 pub mod solidcraft_pane;
 pub mod raster;
 pub mod solid;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub mod solid_gpu;

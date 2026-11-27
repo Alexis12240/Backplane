@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 /* i18n-ok: labels the settings page draws through tr; font names */ pub const THEMES: [(&str, &str); 3] = [("hub", "Follow the hub"), ("dark", "Dark"), ("light", "Light")];
 /// The 3D viewers' background (Mech and 3D board share it): follow the theme, or light, dark, or a colour of the person's own (docs/VIEWER-BACKGROUND.md).
 /* i18n-ok: labels the settings page draws through tr */ pub const VIEWER_BGS: [(&str, &str); 4] = [("auto", "Auto"), ("light", "Light"), ("dark", "Dark"), ("custom", "Custom")];
+/// Which renderer draws the 3D view: Auto keeps light models on integrated graphics and migrates heavy ones to a dedicated GPU when available.
+/* i18n-ok: labels the settings page draws through tr */ pub const SOLID_RENDERERS: [(&str, &str); 4] = [("auto", "Auto"), ("dedicated", "Dedicated GPU"), ("integrated", "Integrated GPU"), ("cpu", "CPU")];
 /* i18n-ok: labels the settings page draws through tr; colour names */ pub const VIEWER_BG_SWATCHES: [(&str, u32); 8] = [("Slate", 0x8a94a6), ("Graphite", 0x5a5f66), ("Sand", 0xd9cfb8), ("Sky", 0xa9c7e8), ("Mint", 0xa8d8c0), ("Rose", 0xe2b4bd), ("Plum", 0x6b5b7b), ("Navy", 0x2f4468)];
 /* i18n-ok: labels the settings page draws through tr; font names */ pub const FONTS: [(&str, &str); 3] = [("Noto Sans Mono CJK JP", "Noto Sans Mono"), ("JetBrains Mono", "JetBrains Mono"), (".SystemUIFont", "System UI")];
 /* i18n-ok: labels the settings page draws through tr; font names */ pub const VIEWS: [(&str, &str); 2] = [("last", "Where I left off"), ("list", "The thread list")];
@@ -25,7 +27,7 @@ pub const KEYS: [&str; 8] = ["enter", "ctrl-enter", "escape", "ctrl-b", "ctrl-k"
 pub struct Local {
     /// The interface language: "auto" (the system's), "en", "ja" or "es" (`i18n::CHOICES`).
     pub lang: String,
-    pub theme: String, pub viewer_bg: String, pub viewer_bg_rgb: u32, pub text_pct: u32, pub font: String, pub sidebar_px: u32, pub viewer_px: u32, pub sidebar_open: bool,
+    pub theme: String, pub viewer_bg: String, pub viewer_bg_rgb: u32, pub solid_renderer: String, pub text_pct: u32, pub font: String, pub sidebar_px: u32, pub viewer_px: u32, pub sidebar_open: bool,
     pub notifications: bool, pub default_view: String, pub shortcuts: BTreeMap<String, String>,
     /// Starred models ("provider/model"), listed first in the model menu; kept on this device.
     pub favs: Vec<String>,
@@ -42,7 +44,7 @@ pub struct Local {
     pub app_channel: String,
 }
 impl Default for Local {
-    fn default() -> Self { Local { lang: "auto".into(), theme: "hub".into(), viewer_bg: "auto".into(), viewer_bg_rgb: VIEWER_BG_SWATCHES[0].1, text_pct: 100, font: FONTS[0].0.into(), sidebar_px: 264, viewer_px: 0, sidebar_open: true, notifications: true, default_view: "last".into(), favs: vec![], shortcuts: BTreeMap::new(), split_hide: String::new(), split_main: 0., split_side: 0., streamer: false, streamer_share: true, streamer_apps: false, kicad_update_later: String::new(), app_channel: String::new() } }
+    fn default() -> Self { Local { lang: "auto".into(), theme: "hub".into(), viewer_bg: "auto".into(), viewer_bg_rgb: VIEWER_BG_SWATCHES[0].1, solid_renderer: "auto".into(), text_pct: 100, font: FONTS[0].0.into(), sidebar_px: 264, viewer_px: 0, sidebar_open: true, notifications: true, default_view: "last".into(), favs: vec![], shortcuts: BTreeMap::new(), split_hide: String::new(), split_main: 0., split_side: 0., streamer: false, streamer_share: true, streamer_apps: false, kicad_update_later: String::new(), app_channel: String::new() } }
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -67,14 +69,15 @@ impl Local {
         if !THEMES.iter().any(|(k, _)| *k == l.theme) { l.theme = "hub".into() }
         if !VIEWER_BGS.iter().any(|(k, _)| *k == l.viewer_bg) { l.viewer_bg = "auto".into() }
         l.viewer_bg_rgb &= 0xff_ffff;
+        if !SOLID_RENDERERS.iter().any(|(k, _)| *k == l.solid_renderer) { l.solid_renderer = "auto".into() }
         if !VIEWS.iter().any(|(k, _)| *k == l.default_view) { l.default_view = "last".into() }
         if l.font.is_empty() { l.font = FONTS[0].0.into() }
         for r in [&mut l.split_main, &mut l.split_side] { if !(r.is_finite() && *r > 0. && *r < 1.) { *r = 0. } }
         l.shortcuts.retain(|a, k| crate::keys::rebindable(a) && crate::keys::choices(a).contains(k));
         l
     }
-    /// What the app starts with; the language in force is set from it here, once.
-    pub fn load() -> Local { let l = path().map(|p| Local::read(&p)).unwrap_or_default(); crate::i18n::set_choice(&l.lang); l }
+    /// What the app starts with; the language and 3D renderer in force are set from it here, once.
+    pub fn load() -> Local { let l = path().map(|p| Local::read(&p)).unwrap_or_default(); crate::i18n::set_choice(&l.lang); crate::viewers::solid::set_renderer_choice(&l.solid_renderer); l }
     /// Written beside and renamed; a failure is said once on stderr and changes nothing else.
     pub fn save(&self) { if let Some(p) = path() { self.save_to(&p) } }
     pub fn save_to(&self, p: &std::path::Path) {
@@ -92,6 +95,7 @@ impl Local {
             "lang" if crate::i18n::CHOICES.iter().any(|(k, _)| *k == value) => self.lang = value.into(),
             "theme" if THEMES.iter().any(|(k, _)| *k == value) => self.theme = value.into(),
             "viewer-bg" if VIEWER_BGS.iter().any(|(k, _)| *k == value) => self.viewer_bg = value.into(),
+            "solid-renderer" if SOLID_RENDERERS.iter().any(|(k, _)| *k == value) => self.solid_renderer = value.into(),
             "viewer-bg-color" => { let Ok(c) = u32::from_str_radix(value.trim_start_matches('#'), 16) else { return false }; if value.trim_start_matches('#').len() != 6 { return false } self.viewer_bg_rgb = c; self.viewer_bg = "custom".into(); }
             "viewer-bg-shade" => { // a step lighter ("+") or darker ("-") of the custom colour
                 let k = if value == "-" { 0.9 } else { 1.0 / 0.9 };
@@ -123,6 +127,8 @@ impl Local {
     }
     /// The 3D viewers' background for the theme now (`light`: the resolved theme).
     pub fn viewer_backdrop(&self, light: bool) -> crate::viewers::raster::Backdrop { crate::viewers::raster::Backdrop::resolve(&self.viewer_bg, self.viewer_bg_rgb, light) }
+    /// The 3D renderer choice for this device.
+    pub fn renderer_mode(&self) -> crate::viewers::solid::RendererMode { crate::viewers::solid::RendererMode::parse(&self.solid_renderer) }
     pub fn font_label(&self) -> &str { FONTS.iter().find(|(k, _)| *k == self.font).map_or("Noto Sans Mono", |(_, l)| l) }
     /// Whether the picture is light: this device's choice, else the hub's.
     pub fn light(&self, hub_light: bool) -> bool { match self.theme.as_str() { "light" => true, "dark" => false, _ => hub_light } }
@@ -170,6 +176,19 @@ mod tests {
         assert!(!l.set("viewer-bg-color", "zzzzzz") && !l.set("viewer-bg-color", "fff") && !l.set("viewer-bg", "neon"));
         l.viewer_bg_rgb = 0x808080; assert!(l.set("viewer-bg-shade", "+")); assert!(l.viewer_bg_rgb & 255 > 0x80); assert!(l.set("viewer-bg-shade", "-")); assert!(l.set("viewer-bg-shade", "-")); assert!(l.viewer_bg_rgb & 255 < 0x80);
         let p = tmp("vbg"); l.save_to(&p); assert_eq!(Local::read(&p), l); std::fs::write(&p, br#"{"viewer_bg":"neon","viewer_bg_rgb":4294967295}"#).unwrap(); let r = Local::read(&p); assert_eq!((r.viewer_bg.as_str(), r.viewer_bg_rgb), ("auto", 0xffffff)); let _ = std::fs::remove_file(&p);
+    }
+    #[test] fn the_3d_renderer_defaults_to_auto_and_rejects_unknown_values() {
+        let mut l = Local::default();
+        assert_eq!(l.solid_renderer, "auto");
+        assert_eq!(l.renderer_mode(), crate::viewers::solid::RendererMode::Auto);
+        assert!(l.set("solid-renderer", "dedicated") && l.renderer_mode() == crate::viewers::solid::RendererMode::Dedicated);
+        assert!(l.set("solid-renderer", "integrated") && l.renderer_mode() == crate::viewers::solid::RendererMode::Integrated);
+        assert!(l.set("solid-renderer", "cpu") && l.renderer_mode() == crate::viewers::solid::RendererMode::Cpu);
+        assert!(!l.set("solid-renderer", "quantum") && l.solid_renderer == "cpu");
+        let p = tmp("sren");
+        std::fs::write(&p, br#"{"solid_renderer":"warp"}"#).unwrap(); assert_eq!(Local::read(&p).solid_renderer, "auto");
+        std::fs::write(&p, br#"{"solid_renderer":"dedicated"}"#).unwrap(); assert_eq!(Local::read(&p).solid_renderer, "dedicated");
+        let _ = std::fs::remove_file(&p);
     }
     #[test] fn steps_stop_at_the_ends_and_the_theme_and_font_cycle() {
         let mut l = Local::default(); for _ in 0..20 { l.set("text", "+"); } assert_eq!(l.text_pct, 160); for _ in 0..20 { l.set("text", "-"); } assert_eq!(l.text_pct, 80);

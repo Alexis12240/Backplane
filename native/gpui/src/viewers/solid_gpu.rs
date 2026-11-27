@@ -2,7 +2,7 @@
 //! worker thread, with a context of its own (gpui lends out neither its device nor a way to draw into its frame on Linux, so the picture reaches it as an image). None from `new`
 //! when the machine has no usable device, or only a software one, which draws slower than raster.rs: the page then uses that. BACKPLANE_SOLID_RENDERER=cpu or gpu forces the choice.
 use super::raster::Backdrop;
-use super::solid::{Camera, Mesh, FOV};
+use super::solid::{Camera, Mesh, RendererMode, FOV};
 use blade_graphics as gpu;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -94,20 +94,220 @@ fn pipelines(ctx: &gpu::Context) -> Pipelines {
     }
 }
 
-/// The one GPU context of the process, made at the first picture of any 3D page and never torn down: dropped by a page's worker as the app quits, it would race
-/// the driver's own teardown in `exit` (NVIDIA: a double free, or a hang), and a page closing should not cost a new device for the next one. None inside when
-/// there is no usable device, or after one failed a picture (then left as it is, not destroyed: it may be wedged).
-pub fn shared() -> &'static Mutex<Option<Gpu>> { static GPU: OnceLock<Mutex<Option<Gpu>>> = OnceLock::new(); GPU.get_or_init(|| Mutex::new(Gpu::new())) }
+/// Triangle count above which `RendererMode::Auto` promotes rendering from integrated graphics to a dedicated GPU when one is available.
+pub const AUTO_DGPU_TRIS: usize = 20_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdapterKind { Integrated, Discrete, Virtual, Cpu, Other }
+impl AdapterKind {
+    fn from_vk(t: i32) -> Self { match t { 1 => Self::Integrated, 2 => Self::Discrete, 3 => Self::Virtual, 4 => Self::Cpu, _ => Self::Other } }
+    pub fn tag(self) -> &'static str { match self { Self::Discrete => "dgpu", Self::Integrated => "igpu", _ => "gpu" } }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Adapter { pub id: u32, pub kind: AdapterKind, pub name: String }
+
+/// Ordered hardware adapter candidates `(device_id, stats_tag)` for `(mode, tris)`.
+/// Empty means no GPU should be used (CPU rasterizer handles it, e.g. `Mode::Cpu`, or `Mode::Integrated` with no integrated GPU).
+pub fn candidate_adapters(adapters: &[Adapter], mode: RendererMode, tris: usize) -> Vec<(u32, &'static str)> {
+    let mut out = Vec::new();
+    let mut push_kind = |kind: AdapterKind| {
+        for a in adapters {
+            if a.kind == kind && a.id != 0 && !out.iter().any(|&(id, _)| id == a.id) { out.push((a.id, a.kind.tag())); }
+        }
+    };
+    let push_other = |out: &mut Vec<(u32, &'static str)>| {
+        for a in adapters {
+            if !matches!(a.kind, AdapterKind::Cpu | AdapterKind::Integrated | AdapterKind::Discrete) && a.id != 0 && !out.iter().any(|&(id, _)| id == a.id) {
+                out.push((a.id, a.kind.tag()));
+            }
+        }
+    };
+    match mode {
+        RendererMode::Cpu => {}
+        RendererMode::Integrated => push_kind(AdapterKind::Integrated),
+        RendererMode::Dedicated => { push_kind(AdapterKind::Discrete); push_kind(AdapterKind::Integrated); push_other(&mut out); }
+        RendererMode::Auto => {
+            let has_igpu = adapters.iter().any(|a| a.kind == AdapterKind::Integrated && a.id != 0);
+            let has_dgpu = adapters.iter().any(|a| a.kind == AdapterKind::Discrete && a.id != 0);
+            match (has_igpu, has_dgpu) {
+                (true, true) if tris >= AUTO_DGPU_TRIS => { push_kind(AdapterKind::Discrete); push_kind(AdapterKind::Integrated); }
+                (true, true) => { push_kind(AdapterKind::Integrated); push_kind(AdapterKind::Discrete); }
+                (true, false) => push_kind(AdapterKind::Integrated),
+                (false, true) => push_kind(AdapterKind::Discrete),
+                (false, false) => {}
+            }
+            push_other(&mut out);
+        }
+    }
+    out
+}
+
+/// First adapter ID chosen by `candidate_adapters`, if any.
+pub fn select_adapter(adapters: &[Adapter], mode: RendererMode, tris: usize) -> Option<u32> {
+    candidate_adapters(adapters, mode, tris).first().map(|&(id, _)| id)
+}
+
+/// Minimal Vulkan physical device probe (returns `None` if no Vulkan loader can be opened, so callers may fall back to `device_id = 0`).
+fn probe_vulkan() -> Option<Vec<Adapter>> {
+    use std::ffi::{c_char, c_void, CStr};
+    #[repr(C)]
+    struct VkApplicationInfo { s_type: i32, p_next: *const c_void, p_app: *const c_char, app_ver: u32, p_eng: *const c_char, eng_ver: u32, api_ver: u32 }
+    #[repr(C)]
+    struct VkInstanceCreateInfo { s_type: i32, p_next: *const c_void, flags: u32, p_app: *const VkApplicationInfo, layers: u32, pp_layers: *const *const c_char, exts: u32, pp_exts: *const *const c_char }
+    type GetInstProc = unsafe extern "system" fn(*mut c_void, *const c_char) -> *const c_void;
+    type CreateInst = unsafe extern "system" fn(*const VkInstanceCreateInfo, *const c_void, *mut *mut c_void) -> i32;
+    type DestroyInst = unsafe extern "system" fn(*mut c_void, *const c_void);
+    type EnumDevs = unsafe extern "system" fn(*mut c_void, *mut u32, *mut *mut c_void) -> i32;
+    type GetProps = unsafe extern "system" fn(*mut c_void, *mut u8);
+
+    #[cfg(target_os = "windows")]
+    unsafe fn open_vk() -> Option<(*mut c_void, GetInstProc)> {
+        unsafe extern "system" {
+            fn LoadLibraryA(name: *const c_char) -> *mut c_void;
+            fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *const c_void;
+        }
+        let lib = unsafe { LoadLibraryA(c"vulkan-1.dll".as_ptr()) };
+        if lib.is_null() { return None }
+        let sym = unsafe { GetProcAddress(lib, c"vkGetInstanceProcAddr".as_ptr()) };
+        if sym.is_null() { unsafe { close_vk(lib) }; return None }
+        Some((lib, unsafe { std::mem::transmute(sym) }))
+    }
+    #[cfg(target_os = "windows")]
+    unsafe fn close_vk(lib: *mut c_void) {
+        unsafe extern "system" { fn FreeLibrary(module: *mut c_void) -> i32; }
+        unsafe { FreeLibrary(lib) };
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn open_vk() -> Option<(*mut c_void, GetInstProc)> {
+        let mut lib = unsafe { libc::dlopen(c"libvulkan.so.1".as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+        if lib.is_null() { lib = unsafe { libc::dlopen(c"libvulkan.so".as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) }; }
+        if lib.is_null() { return None }
+        let sym = unsafe { libc::dlsym(lib, c"vkGetInstanceProcAddr".as_ptr()) };
+        if sym.is_null() { unsafe { close_vk(lib) }; return None }
+        Some((lib, unsafe { std::mem::transmute(sym) }))
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn close_vk(lib: *mut c_void) { unsafe { libc::dlclose(lib) }; }
+
+    unsafe {
+        let (lib, get_proc) = open_vk()?;
+        let mut out = None;
+        let p_create = get_proc(std::ptr::null_mut(), c"vkCreateInstance".as_ptr());
+        if !p_create.is_null() {
+            let create: CreateInst = std::mem::transmute(p_create);
+            let app = VkApplicationInfo { s_type: 0, p_next: std::ptr::null(), p_app: c"backplane".as_ptr(), app_ver: 0, p_eng: c"backplane".as_ptr(), eng_ver: 0, api_ver: (1 << 22) | (1 << 12) };
+            let info = VkInstanceCreateInfo { s_type: 1, p_next: std::ptr::null(), flags: 0, p_app: &app, layers: 0, pp_layers: std::ptr::null(), exts: 0, pp_exts: std::ptr::null() };
+            let mut inst: *mut c_void = std::ptr::null_mut();
+            if create(&info, std::ptr::null(), &mut inst) == 0 && !inst.is_null() {
+                let p_destroy = get_proc(inst, c"vkDestroyInstance".as_ptr());
+                let p_enum = get_proc(inst, c"vkEnumeratePhysicalDevices".as_ptr());
+                let p_props = get_proc(inst, c"vkGetPhysicalDeviceProperties".as_ptr());
+                if !p_enum.is_null() && !p_props.is_null() {
+                    let enum_devs: EnumDevs = std::mem::transmute(p_enum);
+                    let get_props: GetProps = std::mem::transmute(p_props);
+                    let mut n = 0u32;
+                    if enum_devs(inst, &mut n, std::ptr::null_mut()) == 0 {
+                        let mut devs = vec![std::ptr::null_mut(); n as usize];
+                        if n == 0 || enum_devs(inst, &mut n, devs.as_mut_ptr()) >= 0 {
+                            devs.truncate(n as usize);
+                            let mut list = Vec::with_capacity(devs.len());
+                            for d in devs {
+                                let mut raw = [0u64; 256]; // 2048 bytes, > sizeof(VkPhysicalDeviceProperties) (~824 bytes)
+                                get_props(d, raw.as_mut_ptr() as *mut u8);
+                                let bytes = std::slice::from_raw_parts(raw.as_ptr() as *const u8, 276);
+                                let id = u32::from_ne_bytes(bytes[12..16].try_into().unwrap());
+                                let ty = i32::from_ne_bytes(bytes[16..20].try_into().unwrap());
+                                let name = CStr::from_bytes_until_nul(&bytes[20..276]).ok().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                                list.push(Adapter { id, kind: AdapterKind::from_vk(ty), name });
+                            }
+                            out = Some(list);
+                        }
+                    }
+                }
+                if !p_destroy.is_null() {
+                    let destroy: DestroyInst = std::mem::transmute(p_destroy);
+                    destroy(inst, std::ptr::null());
+                }
+            }
+        }
+        close_vk(lib);
+        out
+    }
+}
+
+pub fn adapters() -> &'static Option<Vec<Adapter>> {
+    static LIST: OnceLock<Option<Vec<Adapter>>> = OnceLock::new();
+    LIST.get_or_init(probe_vulkan)
+}
+
+enum Slot { Ready(Gpu), Failed }
+
+/// Lazily initialized GPU multiplexer: keeps one context per active adapter for the process lifetime (never torn down on exit) and releases
+/// uploaded vertex buffers when switching adapters or dropping to CPU.
+#[derive(Default)]
+pub struct Mux { slots: Vec<(u32, Slot)>, active: Option<usize> }
+impl Mux {
+    fn slot_index(&mut self, device_id: u32, tag: &str) -> usize {
+        if let Some(i) = self.slots.iter().position(|(id, _)| *id == device_id) { return i }
+        let slot = match Gpu::for_device(device_id, false) {
+            Some(g) => { log::info!("3D page: opened {tag} adapter {} ({:#x})", g.device, device_id); Slot::Ready(g) }
+            None => Slot::Failed,
+        };
+        self.slots.push((device_id, slot));
+        self.slots.len() - 1
+    }
+    pub fn forget(&mut self) {
+        if let Some(prev) = self.active.take() {
+            if let Some((_, Slot::Ready(g))) = self.slots.get_mut(prev) { g.forget(); }
+        }
+    }
+    pub fn render_layers(&mut self, mode: RendererMode, tris: usize, layers: &[(&Arc<Mesh>, Option<u32>)], fades: &[f32], cam: &Camera, w: usize, h: usize, back: &Backdrop) -> Option<(Vec<u8>, &'static str)> {
+        if mode == RendererMode::Cpu { self.forget(); return None }
+        let candidates: Vec<(u32, &'static str)> = match adapters() {
+            Some(list) => candidate_adapters(list, mode, tris),
+            None => if matches!(mode, RendererMode::Auto | RendererMode::Dedicated) { vec![(0, "gpu")] } else { Vec::new() },
+        };
+        if candidates.is_empty() { self.forget(); return None }
+        for (id, tag) in candidates {
+            let idx = self.slot_index(id, tag);
+            if matches!(self.slots[idx].1, Slot::Failed) { continue }
+            if let Some(prev) = self.active { if prev != idx { if let Some((_, Slot::Ready(g))) = self.slots.get_mut(prev) { g.forget(); } } }
+            let rendered = if let Slot::Ready(g) = &mut self.slots[idx].1 { g.render_layers(layers, fades, cam, w, h, back) } else { None };
+            if let Some(px) = rendered {
+                self.active = Some(idx);
+                return Some((px, tag));
+            }
+            log::warn!("3D page: GPU device {id:#x} ({tag}) failed a picture, trying fallback");
+            let dead = std::mem::replace(&mut self.slots[idx].1, Slot::Failed);
+            if let Slot::Ready(g) = dead { std::mem::forget(g); }
+            if self.active == Some(idx) { self.active = None; }
+        }
+        None
+    }
+}
+
+pub fn mux() -> &'static Mutex<Mux> {
+    static MUX: OnceLock<Mutex<Mux>> = OnceLock::new();
+    MUX.get_or_init(|| Mutex::new(Mux::default()))
+}
+
 impl Gpu {
-    pub fn new() -> Option<Gpu> {
-        let want = std::env::var("BACKPLANE_SOLID_RENDERER").unwrap_or_default();
-        if want == "cpu" { return None }
-        let ctx = unsafe { gpu::Context::init(gpu::ContextDesc { presentation: false, ..Default::default() }) }.ok()?;
+    pub fn for_device(device_id: u32, allow_software: bool) -> Option<Gpu> {
+        let ctx = unsafe { gpu::Context::init(gpu::ContextDesc { presentation: false, device_id, ..Default::default() }) }.ok()?;
         let info = ctx.device_information().clone();
-        if ctx.capabilities().sample_count_mask & SAMPLES == 0 || (info.is_software_emulated && want != "gpu") { return None }
+        if ctx.capabilities().sample_count_mask & SAMPLES == 0 || (info.is_software_emulated && !allow_software) { return None }
         let encoder = ctx.create_command_encoder(gpu::CommandEncoderDesc { name: "solid", buffer_count: 2 });
         let pipes = pipelines(&ctx);
         Some(Gpu { ctx, encoder, pipes, targets: Vec::new(), models: Vec::new(), fades: None, last: None, device: info.device_name })
+    }
+    pub fn new() -> Option<Gpu> {
+        let want = std::env::var("BACKPLANE_SOLID_RENDERER").unwrap_or_default();
+        if want == "cpu" { return None }
+        if want == "gpu" { return Self::for_device(0, true); }
+        let mode = RendererMode::parse(&want);
+        let id = adapters().as_ref().and_then(|list| select_adapter(list, mode, AUTO_DGPU_TRIS)).unwrap_or(0);
+        Self::for_device(id, false)
     }
     fn wait(&mut self) -> bool { match self.last.take() { Some(s) => self.ctx.wait_for(&s, WAIT_MS), None => true } }
     /// The layers into buffers of their own, each once: a layer already there stays (a part that arrives uploads only itself), one no
@@ -229,5 +429,63 @@ impl Drop for Gpu {
         if let Some((f, _)) = self.fades.take() { self.ctx.destroy_buffer(f); }
         for p in [&mut self.pipes.bg, &mut self.pipes.opaque, &mut self.pipes.depth, &mut self.pipes.blend, &mut self.pipes.fade] { self.ctx.destroy_render_pipeline(p); }
         self.ctx.destroy_command_encoder(&mut self.encoder);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test] fn auto_multiplexes_between_integrated_and_dedicated_by_triangle_count() {
+        let dual = vec![
+            Adapter { id: 0x15bf, kind: AdapterKind::Integrated, name: "Radeon iGPU".into() },
+            Adapter { id: 0x28e0, kind: AdapterKind::Discrete, name: "RTX dGPU".into() },
+            Adapter { id: 0x9999, kind: AdapterKind::Cpu, name: "llvmpipe".into() },
+        ];
+        assert_eq!(select_adapter(&dual, RendererMode::Auto, 500), Some(0x15bf), "light model stays on integrated GPU");
+        assert_eq!(select_adapter(&dual, RendererMode::Auto, AUTO_DGPU_TRIS - 1), Some(0x15bf));
+        assert_eq!(select_adapter(&dual, RendererMode::Auto, AUTO_DGPU_TRIS), Some(0x28e0), "heavy model migrates to dedicated GPU");
+        assert_eq!(candidate_adapters(&dual, RendererMode::Auto, AUTO_DGPU_TRIS), vec![(0x28e0, "dgpu"), (0x15bf, "igpu")]);
+        assert_eq!(select_adapter(&dual, RendererMode::Dedicated, 100), Some(0x28e0));
+        assert_eq!(candidate_adapters(&dual, RendererMode::Integrated, 500_000), vec![(0x15bf, "igpu")], "integrated mode never touches dGPU");
+        assert!(candidate_adapters(&dual, RendererMode::Cpu, 500_000).is_empty());
+
+        let dgpu_only = vec![Adapter { id: 0x28e0, kind: AdapterKind::Discrete, name: "RTX dGPU".into() }];
+        assert_eq!(select_adapter(&dgpu_only, RendererMode::Auto, 100), Some(0x28e0), "single-dGPU system still uses GPU for light models");
+        assert_eq!(select_adapter(&dgpu_only, RendererMode::Integrated, 100), None, "integrated mode refuses dGPU-only wake");
+
+        let sw_only = vec![Adapter { id: 0x9999, kind: AdapterKind::Cpu, name: "WARP".into() }];
+        assert_eq!(select_adapter(&sw_only, RendererMode::Auto, 100_000), None, "software adapters are left for raster.rs");
+    }
+    #[test] fn probe_and_mux_render_when_hardware_is_present() {
+        let m = Arc::new(Mesh {
+            tris: vec![[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]],
+            colors: vec![0x00ff0000],
+            groups: vec![0],
+            refs: vec![String::new()],
+            center: [0.3, 0.3, 0.0],
+            radius: 1.0,
+        });
+        let cam = Camera::fitted(&m);
+        let list = adapters();
+        eprintln!("detected Vulkan adapters: {list:?}");
+        let mut local_mux = Mux::default();
+        assert!(local_mux.render_layers(RendererMode::Cpu, m.tris.len(), &[(&m, None)], &[], &cam, 32, 32, &Backdrop::DARK).is_none());
+        if let Some(hw) = list.as_ref().and_then(|v| select_adapter(v, RendererMode::Auto, AUTO_DGPU_TRIS)) {
+            assert!(hw != 0);
+            let light = local_mux.render_layers(RendererMode::Auto, 1, &[(&m, None)], &[], &cam, 32, 32, &Backdrop::DARK).expect("light render");
+            let heavy = local_mux.render_layers(RendererMode::Auto, AUTO_DGPU_TRIS, &[(&m, None)], &[], &cam, 32, 32, &Backdrop::DARK).expect("heavy render");
+            if let Some(v) = list.as_ref() {
+                let has_i = v.iter().any(|a| a.kind == AdapterKind::Integrated && a.id != 0);
+                let has_d = v.iter().any(|a| a.kind == AdapterKind::Discrete && a.id != 0);
+                if has_i && has_d {
+                    assert_eq!(light.1, "igpu");
+                    assert_eq!(heavy.1, "dgpu");
+                    let ded = local_mux.render_layers(RendererMode::Dedicated, 1, &[(&m, None)], &[], &cam, 32, 32, &Backdrop::DARK).expect("dedicated override");
+                    let integ = local_mux.render_layers(RendererMode::Integrated, AUTO_DGPU_TRIS, &[(&m, None)], &[], &cam, 32, 32, &Backdrop::DARK).expect("integrated override");
+                    assert_eq!((ded.1, integ.1), ("dgpu", "igpu"));
+                }
+            }
+        }
     }
 }

@@ -504,14 +504,48 @@ pub fn shows_for_key(page_key: &str, image_key: &str, ticket: u64, shown: u64, f
 pub fn image_matches_key(page_key: &str, image_key: &str, has_image: bool) -> bool {
     has_image && !page_key.is_empty() && page_key == image_key
 }
-/// What draws: the process's GPU (solid_gpu::shared), or the cores when there is none or it fails.
+/// Which backend draws the 3D view: Auto multiplexes between integrated GPU (light models) and dedicated GPU (heavy models) on dual-GPU devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RendererMode { Auto, Dedicated, Integrated, Cpu }
+impl RendererMode {
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "cpu" => Self::Cpu,
+            "dedicated" | "gpu" => Self::Dedicated,
+            "integrated" => Self::Integrated,
+            _ => Self::Auto,
+        }
+    }
+    pub fn as_u8(self) -> u8 { match self { Self::Auto => 0, Self::Dedicated => 1, Self::Integrated => 2, Self::Cpu => 3 } }
+    pub fn from_u8(v: u8) -> Self { match v { 1 => Self::Dedicated, 2 => Self::Integrated, 3 => Self::Cpu, _ => Self::Auto } }
+    /// Make this setting active for render workers (`BACKPLANE_SOLID_RENDERER` still overrides when set).
+    pub fn make_current(self) { RENDERER_MODE.store(self.as_u8(), Ordering::Relaxed); }
+    pub fn current() -> Self {
+        if let Ok(v) = std::env::var("BACKPLANE_SOLID_RENDERER") {
+            let v = v.trim();
+            if !v.is_empty() { return Self::parse(v) }
+        }
+        Self::from_u8(RENDERER_MODE.load(Ordering::Relaxed))
+    }
+}
+static RENDERER_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub fn set_renderer_choice(s: &str) { RendererMode::parse(s).make_current(); }
+
+/// What draws: the GPU multiplexer (solid_gpu::mux), or the CPU cores when in CPU mode, no GPU fits, or GPU rendering fails.
 /// `cpu`: the layers made one mesh for the CPU's drawing, and the layers it was made of (Weak: no later mesh can take their addresses).
 #[derive(Default)] struct Drawer { cpu: Option<(Vec<std::sync::Weak<Mesh>>, Arc<Mesh>)> }
 impl Drawer {
     fn draw(&mut self, model: &Layers, fades: &[f32], cam: &Camera, w: usize, h: usize, ss: usize, back: &raster::Backdrop, alive: &(dyn Fn() -> bool + Sync)) -> Option<(Vec<u8>, &'static str)> {
-        #[cfg(target_os = "linux")] {
-            let mut gpu = super::solid_gpu::shared().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(g) = gpu.as_mut() { match g.render_layers(&model.list(), fades, cam, w, h, back) { Some(px) => return Some((px, "gpu")), None => { log::warn!("3D page: the GPU failed a picture, drawing on the CPU from now on"); std::mem::forget(gpu.take()); } } }
+        self.draw_with_mode(RendererMode::current(), model, fades, cam, w, h, ss, back, alive)
+    }
+    fn draw_with_mode(&mut self, mode: RendererMode, model: &Layers, fades: &[f32], cam: &Camera, w: usize, h: usize, ss: usize, back: &raster::Backdrop, alive: &(dyn Fn() -> bool + Sync)) -> Option<(Vec<u8>, &'static str)> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))] {
+            let mut mux = super::solid_gpu::mux().lock().unwrap_or_else(|e| e.into_inner());
+            if mode == RendererMode::Cpu {
+                mux.forget();
+            } else if let Some(res) = mux.render_layers(mode, model.tris(), &model.list(), fades, cam, w, h, back) {
+                return Some(res);
+            }
         }
         let mesh = self.cpu_mesh(model)?;
         raster::render_faded(&mesh, fades, cam, w, h, ss, back, alive).map(|px| (px, "cpu"))
@@ -534,7 +568,7 @@ impl Drawer {
     }
     /// The model's buffer off the GPU (the page is put away).
     fn forget(&mut self) {
-        #[cfg(target_os = "linux")] { if let Some(g) = super::solid_gpu::shared().lock().unwrap_or_else(|e| e.into_inner()).as_mut() { g.forget(); } }
+        #[cfg(any(target_os = "linux", target_os = "windows"))] { super::solid_gpu::mux().lock().unwrap_or_else(|e| e.into_inner()).forget(); }
     }
 }
 /// Frames queue (every part frame counts; a burst is applied at once, then one model goes to the page); a render request is the latest only.
@@ -669,6 +703,7 @@ struct SolidCore {
     prev: Option<Kept>,
     restored: Option<usize>,
     back: raster::Backdrop,
+    renderer: RendererMode,
     asked: (usize, usize),
     latest: u64,
     on_screen: u64,
@@ -680,7 +715,7 @@ impl SolidCore {
             probe: String::new(), lit: None, mesh: None, key: String::new(), cam: None, touched: false, fit_aspect: 0.0,
             fitted: ([0.0; 3], 0.0), refined: Vec::new(), view_rev: 0, image: None, image_key: String::new(),
             image_size: (0, 0), image_view_rev: 0, image_gen: 0, retired: Vec::new(), frames: 0, born: Vec::new(),
-            parts: (0, 0), prev: None, restored: None, back: raster::Backdrop::DARK, asked: (0, 0), latest: 0, on_screen: 0, floor: 0,
+            parts: (0, 0), prev: None, restored: None, back: raster::Backdrop::DARK, renderer: RendererMode::current(), asked: (0, 0), latest: 0, on_screen: 0, floor: 0,
         }
     }
     /// Retire the current image and clear all image metadata so a new source never paints or caches the previous model's pixels.
@@ -915,6 +950,8 @@ impl SolidPage {
     }
 
     pub fn set_backdrop(&mut self, back: raster::Backdrop) { if self.core.back != back { self.core.back = back; self.core.bump_view(); self.ask_render(false); } }
+    /// The 3D renderer choice (device setting): a change redraws at once using the selected backend.
+    pub fn set_renderer(&mut self, mode: RendererMode) { if self.core.renderer != mode { self.core.renderer = mode; self.core.bump_view(); self.ask_render(false); } }
     /// The part the hub's probe names ("" none): drawn lit on a board's model, the picture made again when it changes.
     pub fn set_probe(&mut self, r: &str) { if self.core.probe != r { self.core.probe = r.to_string(); self.core.bump_view(); self.ask_render(false); } }
     /// A click on a board's model (a press let go where it went down): the part under it is lit and told to the window (`SolidEvent::Pick`), which
@@ -1660,7 +1697,7 @@ mod tests {
             let save = |px: Vec<u8>, tag: &str| { let mut px = px; for p in px.chunks_exact_mut(4) { p.swap(0, 2); } image::RgbaImage::from_raw(w as u32, h as u32, px).unwrap().save(format!("{}.{tag}.png", f[1])).unwrap(); };
             let m = Arc::new(m);
             save(render(&m, &c, w, h, 3, &|| true).unwrap(), "cpu");
-            #[cfg(target_os = "linux")] if let Some(g) = super::super::solid_gpu::shared().lock().unwrap().as_mut() { if let Some(px) = g.render_layers(&[(&m, None)], &[], &c, w, h, &super::super::raster::Backdrop::DARK) { save(px, "gpu") } }
+            #[cfg(any(target_os = "linux", target_os = "windows"))] if let Some((px, _)) = super::super::solid_gpu::mux().lock().unwrap().render_layers(super::RendererMode::Auto, m.tris.len(), &[(&m, None)], &[], &c, w, h, &super::super::raster::Backdrop::DARK) { save(px, "gpu") }
             eprintln!("CLOSE {} tris {}", f[1], m.tris.len());
         }
     }
@@ -1782,7 +1819,7 @@ mod tests {
         let mid = (h / 2 * w + w / 2) * 4; let red_of = |p: &[u8]| p[mid + 2] as i32 - p[mid + 1] as i32; // BGRA
         assert!(red_of(&plain) < red_of(&half) && red_of(&half) < red_of(&full), "{} {} {}", red_of(&plain), red_of(&half), red_of(&full));
         assert_eq!(full, super::super::raster::render_faded(&all, &[], &c, w, h, 1, &super::super::raster::Backdrop::DARK, ALIVE).unwrap(), "faded in is the same as never faded");
-        #[cfg(target_os = "linux")] {
+        #[cfg(any(target_os = "linux", target_os = "windows"))] {
             unsafe { std::env::set_var("BACKPLANE_SOLID_RENDERER", "gpu"); }
             if let Some(mut g) = super::super::solid_gpu::Gpu::new() {
                 let a = std::sync::Arc::new(all);
@@ -1798,7 +1835,7 @@ mod tests {
             } else { eprintln!("no GPU here: the GPU half skipped") }
         }
     }
-    #[cfg(target_os = "linux")] #[test] fn gpu_and_cpu_agree() {
+    #[cfg(any(target_os = "linux", target_os = "windows"))] #[test] fn gpu_and_cpu_agree() {
         // SAFETY of the env write: the only test that reads this variable
         unsafe { std::env::set_var("BACKPLANE_SOLID_RENDERER", "gpu"); }
         let Some(mut g) = super::super::solid_gpu::Gpu::new() else { eprintln!("no GPU here: skipped"); return };
@@ -1813,7 +1850,44 @@ mod tests {
         } }
         assert!(seen > 1000 && worst <= 4, "{seen} flat pixels, worst difference {worst}");
     }
-    #[cfg(target_os = "linux")] #[test] #[ignore] fn bench_parts_stream() {
+    #[cfg(any(target_os = "linux", target_os = "windows"))] #[test] fn mux_switches_between_igpu_dgpu_and_cpu_cleanly() {
+        use super::RendererMode;
+        let make = |n| {
+            let (f, _) = super::super::demo::sphere_frame(n);
+            let Some(SolidFrame::Model(_, m)) = parse_frame(&f) else { panic!() };
+            Layers::of(Some(Arc::new(m)), vec![]).unwrap()
+        };
+        let (light, heavy) = (make(5_000), make(25_000));
+        let (cam_l, cam_h) = (Camera::fitted(&light.list()[0].0), Camera::fitted(&heavy.list()[0].0));
+        let mut drawer = Drawer::default();
+        let (w, h) = (320usize, 240usize);
+        let run = |d: &mut Drawer, mode, layers: &Layers, cam: &Camera| {
+            let t = std::time::Instant::now();
+            let res = d.draw_with_mode(mode, layers, &[], cam, w, h, 1, &super::super::raster::Backdrop::DARK, ALIVE).unwrap();
+            (res.0, res.1, t.elapsed().as_secs_f64() * 1000.0)
+        };
+        let (px_auto_l, tag_auto_l, ms_auto_l) = run(&mut drawer, RendererMode::Auto, &light, &cam_l);
+        let (px_auto_h, tag_auto_h, ms_auto_h) = run(&mut drawer, RendererMode::Auto, &heavy, &cam_h);
+        let (px_ded_l, tag_ded_l, ms_ded_l) = run(&mut drawer, RendererMode::Dedicated, &light, &cam_l);
+        let (px_int_h, tag_int_h, ms_int_h) = run(&mut drawer, RendererMode::Integrated, &heavy, &cam_h);
+        let (px_cpu_l, tag_cpu_l, ms_cpu_l) = run(&mut drawer, RendererMode::Cpu, &light, &cam_l);
+        assert_eq!(tag_cpu_l, "cpu");
+        assert_eq!(px_auto_l.len(), w * h * 4);
+        assert_eq!(px_cpu_l.len(), px_auto_l.len());
+        eprintln!("mux probe: auto_light={tag_auto_l}({ms_auto_l:.2}ms) auto_heavy={tag_auto_h}({ms_auto_h:.2}ms) ded_light={tag_ded_l}({ms_ded_l:.2}ms) int_heavy={tag_int_h}({ms_int_h:.2}ms) cpu_light={tag_cpu_l}({ms_cpu_l:.2}ms)");
+        let list = super::super::solid_gpu::adapters();
+        if let Some(v) = list.as_ref() {
+            let has_i = v.iter().any(|a| a.kind == super::super::solid_gpu::AdapterKind::Integrated && a.id != 0);
+            let has_d = v.iter().any(|a| a.kind == super::super::solid_gpu::AdapterKind::Discrete && a.id != 0);
+            if has_i && has_d {
+                assert_eq!((tag_auto_l, tag_auto_h, tag_ded_l, tag_int_h), ("igpu", "dgpu", "dgpu", "igpu"));
+                // light rendered on iGPU and heavy rendered on dGPU match their dedicated/integrated counterparts pixel-for-pixel
+                assert_eq!(px_auto_l.len(), px_ded_l.len());
+                assert_eq!(px_auto_h.len(), px_int_h.len());
+            }
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))] #[test] #[ignore] fn bench_parts_stream() {
         // what each arriving part frame costs the worker: the combined model rebuilt, and its GPU vertices rebuilt
         for n in [283_000, 590_000] { let (f, _) = super::super::demo::sphere_frame(n); let t = std::time::Instant::now(); let m = parse_frame(&f); eprintln!("decode {n} triangles ({} KB): {:.0} ms", f.len() >> 10, t.elapsed().as_secs_f64() * 1000.0); drop(m); }
         let (f, _) = super::super::demo::sphere_frame(283_000);
