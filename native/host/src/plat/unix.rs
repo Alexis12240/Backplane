@@ -46,6 +46,10 @@ pub mod fs {
         }
         #[cfg(not(target_os = "macos"))] { std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())) }
     }
+    /// Number of directory entries (hard links) pointing to a regular file without following symlinks.
+    pub fn file_nlink(p: &std::path::Path) -> std::io::Result<u64> {
+        Ok(std::fs::symlink_metadata(p)?.nlink())
+    }
 }
 
 /// The OS error numbers the hub names.

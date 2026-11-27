@@ -140,7 +140,7 @@ fn check_tree(d: &Path, zip: bool) -> Result<(), String> {
             let e = e.map_err(|e| e.to_string())?; let t = e.file_type().map_err(|e| e.to_string())?;
             if t.is_symlink() { return Err("the archive holds a link".into()) }
             if t.is_dir() { todo.push(e.path()); continue }
-            #[cfg(unix)] { use crate::plat::fs::MetadataExt; if e.metadata().map_err(|e| e.to_string())?.nlink() > 1 { return Err("the archive holds a hard link".into()) } }
+            if crate::plat::fs::file_nlink(&e.path()).map_err(|e| e.to_string())? > 1 { return Err("the archive holds a hard link".into()) }
         }
     }
     Ok(())
@@ -547,6 +547,12 @@ mod tests {
         let r = Rig::new("hard"); let mut f = Feed::new(); let x = found(&mut f, &r, b"archive");
         let e = stage(&x, &r.d.join("b"), &|u, o, m| f.get(u, o, m), &|a, d| { good_tree(a, d)?; fs::write(d.join("f"), b"x").unwrap(); fs::hard_link(d.join("f"), d.join("g")).unwrap(); Ok(()) }).unwrap_err();
         assert!(e.contains("hard link"), "{e}"); assert!(left(&r).is_empty());
+        let plain = r.d.join("plain"); fs::write(&plain, b"ok").unwrap();
+        assert_eq!(crate::plat::fs::file_nlink(&plain).unwrap(), 1);
+        let extra = r.d.join("extra"); fs::hard_link(&plain, &extra).unwrap();
+        assert_eq!(crate::plat::fs::file_nlink(&plain).unwrap(), 2);
+        fs::remove_file(&extra).unwrap();
+        assert_eq!(crate::plat::fs::file_nlink(&plain).unwrap(), 1);
     }
     #[test] fn a_nightly_hub_ignores_a_stable_hotfix_and_waits_for_the_next_nightly() {
         let r = Rig::new("nightly-hotfix"); let mut f = Feed::new(); let k = keys();

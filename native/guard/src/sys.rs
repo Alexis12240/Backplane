@@ -38,6 +38,11 @@ use std::{path::Path, process::{Child, Command, ExitStatus}};
             Err(_) => true,
         }
     }
+    /// Number of hard links pointing to a regular file without following symlinks.
+    pub fn file_nlink(path: &std::path::Path) -> std::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::symlink_metadata(path)?.nlink())
+    }
     pub fn alive(pid: u32) -> bool {
         pid > 0 && pid <= i32::MAX as u32
             && (unsafe { libc::kill(pid as i32, 0) } == 0
@@ -94,6 +99,17 @@ use std::{path::Path, process::{Child, Command, ExitStatus}};
             Err(_) => true,
         }
     }
+    /// Number of hard links pointing to a regular file (`BY_HANDLE_FILE_INFORMATION.nNumberOfLinks`).
+    pub fn file_nlink(path: &std::path::Path) -> std::io::Result<u64> {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let f = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
+        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as *mut core::ffi::c_void, &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(u64::from(info.links))
+    }
     pub fn alive(pid: u32) -> bool { quiet("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().map_or(false, |o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())) }
     #[link(name = "kernel32")] extern "system" {
         fn GetDiskFreeSpaceExW(dir: *const u16, free: *mut u64, total: *mut u64, all: *mut u64) -> i32;
@@ -119,7 +135,7 @@ use std::{path::Path, process::{Child, Command, ExitStatus}};
     fn quiet(name: &str) -> std::process::Command { use std::os::windows::process::CommandExt; let mut c = std::process::Command::new(name); c.creation_flags(NO_WINDOW); c }
     pub fn signal_of(_: &std::process::ExitStatus) -> Option<i32> { None }
 }
-pub use os::{abort, alive, awake_s, clean_signals, detach, kill, same_file, signal_of, space, stop_asked, term, watch_stop};
+pub use os::{abort, alive, awake_s, clean_signals, detach, file_nlink, kill, same_file, signal_of, space, stop_asked, term, watch_stop};
 pub fn free_bytes(p: &Path) -> Option<u64> { space(p).map(|s| s.0) }
 
 fn trim_end_seps(p: &Path) -> String {

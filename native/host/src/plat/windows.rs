@@ -30,6 +30,18 @@ pub mod fs {
         let s = std::ffi::OsString::from_wide(&b[..n as usize]).to_string_lossy().into_owned();
         Ok(if let Some(r) = s.strip_prefix(r"\\?\UNC\") { format!(r"\\{r}").into() } else if let Some(r) = s.strip_prefix(r"\\?\") { r.into() } else { s.into() })
     }
+    /// Number of directory entries (hard links) pointing to a regular file via `BY_HANDLE_FILE_INFORMATION.nNumberOfLinks`.
+    pub fn file_nlink(p: &Path) -> io::Result<u64> {
+        use std::os::windows::{fs::OpenOptionsExt as W, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT};
+        let mut o = fs::OpenOptions::new(); o.read(true); W::custom_flags(&mut o, FILE_FLAG_OPEN_REPARSE_POINT);
+        let f = o.open(p)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(info.nNumberOfLinks))
+    }
     pub fn canonicalize<P: AsRef<Path>>(p: P) -> io::Result<std::path::PathBuf> {
         let c = fs::canonicalize(p)?; let s = c.to_string_lossy();
         Ok(if let Some(r) = s.strip_prefix(r"\\?\UNC\") { format!(r"\\{r}").into() } else if let Some(r) = s.strip_prefix(r"\\?\") { r.into() } else { c })

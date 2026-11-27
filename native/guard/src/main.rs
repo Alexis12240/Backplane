@@ -8,7 +8,11 @@ mod http; mod keep; mod pair; mod plan; mod run; mod store; mod sys;
 #[allow(dead_code)] #[path = "../../host/src/update/run.rs"] mod upd_run;
 /// What the hub's updater asks of its `plat` (run.rs: file modes and links; its tests: temp folders).
 #[allow(unused_imports)] mod plat {
-    #[cfg(unix)] pub mod fs { pub use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt}; }
+    pub mod fs {
+        #[cfg(unix)] pub use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        #[allow(dead_code)]
+        pub fn file_nlink(p: &std::path::Path) -> std::io::Result<u64> { crate::sys::file_nlink(p) }
+    }
     #[cfg(test)] pub(crate) use crate::tmp;
 }
 #[cfg(test)] mod tmp;
