@@ -122,6 +122,63 @@ pub fn try_read_next_unlocked(prefix: &Path) -> Result<Option<String>, ()> {
 pub fn current(prefix: &Path) -> String { first(&prefix.join("CURRENT")) }
 fn publish_unlocked(prefix: &Path, tag: &str) -> std::io::Result<()> { put(&prefix.join("CURRENT"), &format!("{tag}\n")) }
 /// The one writer of CURRENT where no guard runs (serialized under `state.lock`).
+/// Refresh `<prefix>/backplane` from `builds/<id>/backplane` when `<prefix>/backplane` already exists as a regular file and
+/// `CURRENT` is empty, older than `id`, or equal to `id` with differing bytes (self-healing pre-`refresh_guard` installs without downgrading).
+pub(crate) fn refresh_guard_unlocked(prefix: &Path, id: &str) {
+    if !name_ok(id) { return }
+    let cur = current(prefix);
+    if !cur.is_empty() && cur != id && !newer(id, &cur) { return }
+    let name = if cfg!(windows) { "backplane.exe" } else { "backplane" };
+    let dst = prefix.join(name);
+    let src = guard_of(prefix, id);
+    if !fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_file()) { return }
+    let Ok(src_meta) = fs::metadata(&src) else { return };
+    if !src_meta.is_file() { return }
+    if cur == id && fs::read(&dst).ok() == fs::read(&src).ok() { return }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if src_meta.permissions().mode() & 0o111 == 0 { return }
+    }
+    let tmp = prefix.join(format!(".{name}.{}", std::process::id()));
+    if fs::copy(&src, &tmp).is_err() {
+        let _ = fs::remove_file(&tmp);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).is_err() || fs::rename(&tmp, &dst).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(entries) = fs::read_dir(prefix) {
+            for entry in entries.flatten() {
+                let s = entry.file_name().to_string_lossy().into_owned();
+                if s.starts_with(".backplane-") && s.ends_with(".exe.old") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        let old = prefix.join(format!(".backplane-{}.exe.old", std::process::id()));
+        let _ = fs::remove_file(&old);
+        if fs::rename(&dst, &old).is_err() {
+            let _ = fs::remove_file(&tmp);
+            return;
+        }
+        if fs::rename(&tmp, &dst).is_err() {
+            let _ = fs::rename(&old, &dst);
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// Serialized guard-binary refresh under `state.lock`.
+pub fn refresh_guard(prefix: &Path, id: &str) {
+    let _ = try_with_state_lock(prefix, || refresh_guard_unlocked(prefix, id));
+}
 pub fn publish(prefix: &Path, tag: &str) -> std::io::Result<()> { try_with_state_lock(prefix, || publish_unlocked(prefix, tag))? }
 /// `BAD`'s ids.
 pub fn bad(prefix: &Path) -> Vec<String> { bad_lines(prefix).into_iter().map(|x| x.0).collect() }
@@ -426,6 +483,7 @@ pub fn opened(prefix: &Path, me: &str, my_nonce: Option<&str>) -> Option<String>
                     return None;
                 }
                 add_good_unlocked(prefix, me);
+                refresh_guard_unlocked(prefix, me);
                 if publish_unlocked(prefix, me).is_err() { return None }
                 let d = dir(prefix); let _ = fs::remove_file(d.join("trial"));
                 if matches!(try_read_next_unlocked(prefix), Ok(Some(ref n)) if n == me) {
@@ -818,5 +876,19 @@ mod tests {
         assert!(bad(p).contains(&"v2".to_string()));
         assert!(trial(p).is_none());
         assert_eq!(next(p), "");
+    }
+
+    #[test] fn opened_refreshes_installed_guard_binary_on_trial_promotion() {
+        let t = tmp("appkeep-guard-refresh");
+        let p: &Path = &t;
+        let name = if cfg!(windows) { "backplane.exe" } else { "backplane" };
+        fs::create_dir_all(p.join("builds/v1")).unwrap();
+        fs::create_dir_all(p.join("builds/v2")).unwrap();
+        fs::write(p.join(name), b"old-guard").unwrap();
+        fs::write(p.join("builds/v2").join(name), b"new-guard").unwrap();
+        publish(p, "v1").unwrap();
+        begin(p, "v2", "v1", 999999, "n-ok").unwrap();
+        assert_eq!(opened(p, "v2", Some("n-ok")), Some("v2".into()));
+        assert_eq!(fs::read(p.join(name)).unwrap(), b"new-guard");
     }
 }

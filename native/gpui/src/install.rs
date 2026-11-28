@@ -167,6 +167,79 @@ fn shortcut(prefix: &Path) {
     let _ = std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &ps]).creation_flags(0x0800_0000).status();
 }
 
+fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+fn contains_utf16le_ci(haystack: &[u8], needle: &str) -> bool {
+    let pat: Vec<u8> = needle.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    if pat.is_empty() { return false }
+    haystack.windows(pat.len()).any(|w| {
+        w.chunks_exact(2).zip(pat.chunks_exact(2)).all(|(a, b)| {
+            let ca = u16::from_le_bytes([a[0], a[1]]);
+            let cb = u16::from_le_bytes([b[0], b[1]]);
+            if ca < 128 && cb < 128 { (ca as u8).eq_ignore_ascii_case(&(cb as u8)) } else { ca == cb }
+        })
+    })
+}
+
+/// Fast pre-filter on raw `.lnk` bytes: true when the shortcut still references a versioned `builds\` path or `backplane-gpui`
+/// (from pre-#1228 installs) so already-migrated `<prefix>\backplane.exe,0` shortcuts never spawn PowerShell.
+pub fn shortcut_bytes_need_icon_repair(raw: &[u8]) -> bool {
+    for pat in ["\\builds\\", "backplane-gpui"] { // i18n-ok: Windows shortcut byte signature
+        if contains_ci(raw, pat.as_bytes()) || contains_utf16le_ci(raw, pat) { return true }
+    }
+    false
+}
+
+/// Chooses `<prefix>\backplane.exe` when it embeds an icon (survives future upgrades), else falls back to `current_exe` when it does.
+pub fn choose_icon_exe(guard: PathBuf, guard_has: bool, app: PathBuf, app_has: bool) -> Option<PathBuf> {
+    if guard_has { Some(guard) } else if app_has { Some(app) } else { None }
+}
+
+/// PowerShell snippet that updates `Backplane.lnk` `IconLocation` only if `TargetPath` points to `<prefix>\backplane.exe`.
+pub fn shortcut_icon_repair_ps(lnk: &Path, prefix: &Path, icon_exe: &Path) -> String {
+    let q = |p: &Path| p.display().to_string().replace('\'', "''");
+    let guard = prefix.join("backplane.exe"); // i18n-ok: Windows binary name
+    let want_icon = format!("{},0", q(icon_exe)); // i18n-ok: Windows icon location
+    format!("$lnk = '{}'; $guard = '{}'; $want = '{}'; $sh = New-Object -ComObject WScript.Shell; $s = $sh.CreateShortcut($lnk); if ($s.TargetPath -ieq $guard -and $s.IconLocation -ine $want) {{ $s.IconLocation = $want; $s.Save() }}", q(lnk), q(&guard), want_icon) // i18n-ok: PowerShell shortcut migration
+}
+
+#[cfg(windows)]
+fn exe_has_icon(path: &Path) -> bool {
+    if !path.is_file() { return false }
+    let w: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PrivateExtractIconsW(w.as_ptr(), 0, 32, 32, std::ptr::null_mut(), std::ptr::null_mut(), 0, 0) > 0 }
+}
+
+/// Repairs a legacy Start-menu `Backplane.lnk` whose `IconLocation` still points into `builds\...` (or `backplane-gpui.exe`).
+#[cfg(windows)]
+pub fn repair_start_menu_shortcut_in(appdata: &Path, prefix: &Path, current_exe: &Path) -> bool {
+    let lnk = appdata.join("Microsoft").join("Windows").join("Start Menu").join("Programs").join("Backplane.lnk"); // i18n-ok: Windows Start Menu path
+    let Ok(raw) = std::fs::read(&lnk) else { return false };
+    if !shortcut_bytes_need_icon_repair(&raw) { return false }
+    let Some(icon_exe) = choose_icon_exe(prefix.join("backplane.exe"), exe_has_icon(&prefix.join("backplane.exe")), current_exe.to_path_buf(), exe_has_icon(current_exe)) else { return false }; // i18n-ok: Windows binary name
+    let ps = shortcut_icon_repair_ps(&lnk, prefix, &icon_exe);
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &ps]).creation_flags(0x0800_0000).status().is_ok_and(|s| s.success()) // i18n-ok: PowerShell CLI args
+}
+
+/// Background self-heal on Windows when running from an installed `CURRENT` build: refreshes a stale `<prefix>\backplane.exe`
+/// (e.g. upgraded from a pre-#1228/#1672 guard) and migrates any legacy Start-menu shortcut pointing at deleted/iconless builds.
+#[cfg(windows)]
+pub fn heal_installed_guard_and_shortcut() {
+    let Ok(me) = std::env::current_exe() else { return };
+    let Some((_, prefix)) = crate::launch::guarded_install(&me) else { return };
+    let Some(tag) = me.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()) else { return };
+    let Some(appdata) = std::env::var_os("APPDATA").filter(|p| !p.is_empty()).map(PathBuf::from) else { return };
+    let _ = std::thread::Builder::new().name("win-shortcut-repair".into()).spawn(move || { // i18n-ok: thread name
+        if crate::appkeep::current(&prefix) == tag {
+            crate::appkeep::refresh_guard(&prefix, &tag);
+        }
+        repair_start_menu_shortcut_in(&appdata, &prefix, &me);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +314,49 @@ mod tests {
         drop(held_lock);
         assert_eq!(crate::appkeep::opened(&pre, "v0.16.0", Some(&nonce)), Some("v0.16.0".into()));
         assert_eq!(crate::appkeep::current(&pre), "v0.16.0");
+    }
+
+    #[test] fn legacy_shortcut_icon_detection_and_target_selection() {
+        let utf16 = |s: &str| s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect::<Vec<u8>>();
+        assert!(shortcut_bytes_need_icon_repair(br"C:\Users\u\AppData\Local\Backplane\builds\v0.15.4\backplane-gpui.exe"));
+        assert!(shortcut_bytes_need_icon_repair(&utf16(r"C:\Users\u\AppData\Local\Backplane\BUILDS\v0.16.0\app.exe")));
+        assert!(!shortcut_bytes_need_icon_repair(&utf16(r"C:\Users\u\AppData\Local\Backplane\backplane.exe")));
+        let pre = PathBuf::from(r"C:\Users\u\AppData\Local\Backplane");
+        let guard = pre.join("backplane.exe");
+        let app = pre.join("builds").join("v0.16.4").join("backplane-gpui.exe");
+        assert_eq!(choose_icon_exe(guard.clone(), true, app.clone(), true), Some(guard.clone()));
+        assert_eq!(choose_icon_exe(guard.clone(), false, app.clone(), true), Some(app.clone()));
+        assert_eq!(choose_icon_exe(guard.clone(), false, app, false), None);
+        let ps = shortcut_icon_repair_ps(&pre.join("Backplane.lnk"), &pre, &guard);
+        assert!(ps.contains("$s.TargetPath -ieq $guard") && ps.contains("backplane.exe,0"));
+    }
+
+    #[cfg(windows)]
+    #[test] fn shortcut_icon_repair_migrates_legacy_builds_icon_in_temp_dir() {
+        let root = tmp("lnk-repair");
+        let appdata = root.join("appdata");
+        let programs = appdata.join("Microsoft").join("Windows").join("Start Menu").join("Programs");
+        std::fs::create_dir_all(&programs).unwrap();
+        let lnk = programs.join("Backplane.lnk");
+        let pre = root.join("Backplane");
+        let cur_dir = pre.join("builds").join("v0.16.4");
+        std::fs::create_dir_all(&cur_dir).unwrap();
+        let me = std::env::current_exe().unwrap();
+        assert!(exe_has_icon(&me), "gpui test exe should carry the embedded Backplane icon");
+        let guard = pre.join("backplane.exe");
+        let cur_app = cur_dir.join("backplane-gpui.exe");
+        std::fs::copy(&me, &guard).unwrap();
+        std::fs::copy(&me, &cur_app).unwrap();
+        let legacy_icon = pre.join("builds").join("v0.15.4-nightly.20261115.2").join("backplane-gpui.exe");
+        let q = |p: &Path| p.display().to_string().replace('\'', "''");
+        let mk = format!("$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{}'); $s.TargetPath = '{}'; $s.IconLocation = '{},0'; $s.Save()",
+            q(&lnk), q(&guard), q(&legacy_icon));
+        assert!(std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &mk]).status().unwrap().success());
+        assert!(repair_start_menu_shortcut_in(&appdata, &pre, &cur_app));
+        let rd = format!("(New-Object -ComObject WScript.Shell).CreateShortcut('{}').IconLocation", q(&lnk));
+        let out = std::process::Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", &rd]).output().unwrap();
+        let icon_loc = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(icon_loc.to_ascii_lowercase(), format!("{},0", guard.display()).to_ascii_lowercase());
+        assert!(!repair_start_menu_shortcut_in(&appdata, &pre, &cur_app), "already migrated shortcut must not re-run repair");
     }
 }

@@ -511,6 +511,7 @@ fn main()->anyhow::Result<()> {
     script::metric(started,"process_start",serde_json::json!({}));
     // Windows: an unpacked release asks to install itself where the guard can update it (install.rs); on Install the installed one runs
     #[cfg(windows)] if install::maybe_install(config.pending) { return Ok(()) }
+    #[cfg(windows)] install::heal_installed_guard_and_shortcut();
     // a hub on another machine: this app keeps its own build (selfupdate.rs); a staged build is tried here, before any window, and this process may become it
     {
         let saved=launch::load();

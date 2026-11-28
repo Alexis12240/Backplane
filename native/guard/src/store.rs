@@ -88,57 +88,9 @@ impl Builds {
     pub fn mark_bad(&self, id: &str, why: &str) { crate::appkeep::mark_bad(&self.0, id, why) }
     /// The one writer of CURRENT in a guarded install: a whole file, renamed over. (Where no guard runs, the desktop app is: appkeep.rs.)
     pub fn publish(&self, id: &str) { let _ = crate::appkeep::publish(&self.0, id); }
-    /// Refresh `<prefix>/backplane` from the newly proven build `id` when `<prefix>/backplane` already exists as a regular file and `id` is newer than `CURRENT` (or `CURRENT` is empty), so future restarts pick up guard fixes without downgrading.
+    /// Refresh `<prefix>/backplane` from `builds/<id>/backplane` under `state.lock`, keeping downgrades disallowed.
     pub fn refresh_guard(&self, id: &str) {
-        let _ = crate::appkeep::try_with_state_lock(&self.0, || {
-            let cur = self.current();
-            if !cur.is_empty() && !crate::appkeep::newer(id, &cur) { return }
-            let name = if cfg!(windows) { "backplane.exe" } else { "backplane" };
-            let dst = self.0.join(name);
-            let src = self.dir(id).join(name);
-            if !fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_file()) { return }
-            let Ok(src_meta) = fs::metadata(&src) else { return };
-            if !src_meta.is_file() { return }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if src_meta.permissions().mode() & 0o111 == 0 { return }
-            }
-            let tmp = self.0.join(format!(".{name}.{}", std::process::id()));
-            if fs::copy(&src, &tmp).is_err() {
-                let _ = fs::remove_file(&tmp);
-                return;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).is_err() || fs::rename(&tmp, &dst).is_err() {
-                    let _ = fs::remove_file(&tmp);
-                }
-            }
-            #[cfg(windows)]
-            {
-                if let Ok(entries) = fs::read_dir(&self.0) {
-                    for entry in entries.flatten() {
-                        let fname = entry.file_name();
-                        let s = fname.to_string_lossy();
-                        if s.starts_with(".backplane-") && s.ends_with(".exe.old") {
-                            let _ = fs::remove_file(entry.path());
-                        }
-                    }
-                }
-                let old = self.0.join(format!(".backplane-{}.exe.old", std::process::id()));
-                let _ = fs::remove_file(&old);
-                if fs::rename(&dst, &old).is_err() {
-                    let _ = fs::remove_file(&tmp);
-                    return;
-                }
-                if fs::rename(&tmp, &dst).is_err() {
-                    let _ = fs::rename(&old, &dst);
-                    let _ = fs::remove_file(&tmp);
-                }
-            }
-        });
+        crate::appkeep::refresh_guard(&self.0, id);
     }
     /// Take the mark off: the person says this build is fine.
     pub fn clear_bad(&self, id: &str) { crate::appkeep::clear_bad(&self.0, id); }
@@ -221,6 +173,12 @@ mod tests {
         // Installed regular guard binary when CURRENT is older ("v1"): replaced atomically with builds/v2/backplane
         fs::write(t.join(name), b"old-guard-v1").unwrap();
         fs::write(t.join("CURRENT"), b"v1\n").unwrap();
+        b.refresh_guard("v2");
+        assert_eq!(fs::read(t.join(name)).unwrap(), b"new-guard-v2");
+
+        // Same-tag heal ("v2" == CURRENT): stale guard bytes from pre-#1672 are replaced, matching bytes are left alone
+        fs::write(t.join("CURRENT"), b"v2\n").unwrap();
+        fs::write(t.join(name), b"stale-guard-0.15").unwrap();
         b.refresh_guard("v2");
         assert_eq!(fs::read(t.join(name)).unwrap(), b"new-guard-v2");
 
