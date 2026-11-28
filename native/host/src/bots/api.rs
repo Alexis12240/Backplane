@@ -36,8 +36,8 @@ fn label(t: &str) -> &'static str { match t { "chat" => "Chat", "mail" => "Mailr
 fn tabs_json(ts: &[&str]) -> Vec<Value> { ts.iter().map(|t| json!({"id":t,"label":label(t)})).collect() }
 /// BU.nav.parent
 fn nav_parent(folded: bool, t: &str) -> &str { if !folded { return t } match t { "status" => "mail", "tasks" => "browser", "hooks" => "settings", _ => t } }
-/// BU.nav.sections
-fn nav_sections(folded: bool, parent: &str) -> &'static [&'static str] { if !folded { return &[] } match parent { "mail" => &["mail", "status"], "browser" => &["browser", "tasks"], "settings" => &["settings", "hooks"], _ => &[] } }
+/// BU.nav.sections: sub-tabs folded under a parent tab in the uberbot's bar (never repeating the parent itself)
+fn nav_sections(folded: bool, parent: &str) -> &'static [&'static str] { if !folded { return &[] } match parent { "mail" => &["status"], "browser" => &["tasks"], "settings" => &["hooks"], _ => &[] } }
 /// What the Memory tab carries in a view: `shown` and `overlay` both carry it, a reply over REPLY_BYTES is refused by the client, and an uberbot's memories can be many times that
 const MEMORY_BYTES: usize = 64 * 1024;
 /// Where each page of the Memory tab starts: whole memories up to MEMORY_BYTES a page (one bigger than a page stands alone).

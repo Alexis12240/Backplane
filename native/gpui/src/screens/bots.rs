@@ -206,14 +206,20 @@ pub fn forms(cx: &mut Context<Backplane>, light: bool, fields: &HashMap<String, 
 pub const BAR_H: f32 = 76.;
 /// The strip is taller with a row of sub-tabs under it (Browser: Tasks, Mailroom: Status, Settings: Webhooks), or they sit under the page.
 /// At the text size in force (scale.rs): it holds two or three lines.
-pub fn bar_h(bot: &Value) -> f32 { crate::scale::s() * if bot["subtabs"].as_array().map_or(false, |a| !a.is_empty()) { BAR_H + 36. } else { BAR_H } }
+/// Sub-tabs shown under the primary bot tab bar, omitting any entry that duplicates the active parent tab in `tabs`.
+fn subtabs(bot: &Value) -> Vec<Tab> {
+    let parent_tabs = tabs(bot, "tabs");
+    let on = bot["navTab"].as_str().or(bot["tab"].as_str()).unwrap_or("chat");
+    tabs(bot, "subtabs").into_iter().filter(|t| !(t.id == on && parent_tabs.iter().any(|p| p.id == t.id))).collect()
+}
+pub fn bar_h(bot: &Value) -> f32 { crate::scale::s() * if !subtabs(bot).is_empty() { BAR_H + 36. } else { BAR_H } }
 pub fn bar(cx: &mut Context<Backplane>, light: bool, bot: &Value) -> Option<AnyElement> {
     if bot["kind"] != "bot" { return None; }
     let c = |n: &str| theme::color(light, n);
     let on = bot["navTab"].as_str().or(bot["tab"].as_str()).unwrap_or("chat").to_string();
     let mut strip = div().flex().gap_1();
     for (i, t) in tabs(bot, "tabs").into_iter().enumerate() { let is = t.id == on; strip = strip.child(btn(cx, light, format!("btab-{i}"), trs(&t.label), is, tab_cmd, t.id)); }
-    let subs = tabs(bot, "subtabs");
+    let subs = subtabs(bot);
     let mut col = div().h(px(bar_h(bot))).flex_shrink_0().px_3().py_1().flex().flex_col().gap_1().border_b_1().border_color(c("line")).bg(c("bg"))
         .child(div().flex().gap_2().items_center().child(div().font_weight(FontWeight::BOLD).child(bot["title"].as_str().map(str::to_string).unwrap_or_else(|| string(bot, "name"))))
             .child(div().text_size(crate::scale::tpx(11.)).text_color(c("dim")).child(trs(&string(bot, "note"))))
@@ -475,7 +481,9 @@ pub fn controls(data: &Value) -> Vec<(String, String, crate::script::Ctl)> {
     }
     let bot = &data["bot"];
     if bot["kind"] != "bot" { return out }
-    /* i18n-ok: e2e control labels */ for (k, key) in [("btab", "tabs"), ("bsub", "subtabs")] { for (i, t) in tabs(bot, key).into_iter().enumerate() { out.push((format!("{k}-{i}"), t.label, a("bot-tab", &t.id))); } }
+    /* i18n-ok: e2e control labels */
+    for (i, t) in tabs(bot, "tabs").into_iter().enumerate() { out.push((format!("btab-{i}"), t.label, a("bot-tab", &t.id))); }
+    for (i, t) in subtabs(bot).into_iter().enumerate() { out.push((format!("bsub-{i}"), t.label, a("bot-tab", &t.id))); }
     if bot["tab"] == "hooks" {
         /* i18n-ok: e2e control labels */ out.push(("hook-new".into(), "New webhook".into(), Ctl::Bot("hook-new".into(), string(bot, "id"))));
         for (i, h) in arr(bot, "hooks").enumerate() {
@@ -646,6 +654,10 @@ mod tests {
     #[test] fn tabs_posts_picks_and_providers_parse_from_the_hubs_rows() {
         let b = j(r#"{"kind":"bot","tabs":[{"id":"chat","label":"Chat"},{"id":"memory","label":"Memory"}],"subtabs":[{"id":"routines","label":"Routines"}],"posts":[{"id":"p1","from":"Kit","text":"hi","ago":"1m","mine":false},{"id":"p2","from":"","text":"yo","ago":"now","mine":true}]}"#);
         assert_eq!(tabs(&b, "tabs").len(), 2); assert_eq!(bar_h(&b), BAR_H + 36.); assert_eq!(bar_h(&j(r#"{"subtabs":[]}"#)), BAR_H); assert_eq!(tabs(&b, "subtabs")[0].id, "routines");
+        let dup = j(r#"{"kind":"bot","tab":"browser","navTab":"browser","tabs":[{"id":"browser","label":"Browser"}],"subtabs":[{"id":"browser","label":"Browser"},{"id":"tasks","label":"Tasks"}]}"#);
+        assert_eq!(subtabs(&dup).into_iter().map(|t| t.id).collect::<Vec<_>>(), ["tasks"]);
+        let only_dup = j(r#"{"kind":"bot","tab":"browser","navTab":"browser","tabs":[{"id":"browser","label":"Browser"}],"subtabs":[{"id":"browser","label":"Browser"}]}"#);
+        assert_eq!(bar_h(&only_dup), BAR_H);
         let p = posts(&b); assert_eq!((p[0].from.as_str(), p[1].mine), ("Kit", true));
         let f = j(r#"{"picks":[{"id":"b1","name":"Kit","on":true},{"id":"b2","name":"Mochi","on":false}],"providers":[{"label":"Claude","provider":"claude","on":false}]}"#);
         assert!(picks(&f)[0].on && !picks(&f)[1].on); assert_eq!(providers(&f)[0].provider, "claude");

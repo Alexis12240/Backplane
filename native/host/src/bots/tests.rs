@@ -498,9 +498,17 @@ async fn th_a(bots: &Arc<Bots>, b: &str) -> String { bots.world().await.bot(b).u
     assert_eq!(chat_thread(&hub, &a).await, Some(th)); assert_eq!(chat_thread(&hub, "nope").await, None);
     assert_eq!(default_tab(), "chat");
     hub.commit(&json!({"$":"UberSet","bot":u,"uid":"u1-x","at":5})).await.unwrap();
-    // the page: Chat unless a tab this bot has is asked for; the uberbot's bar folds Status under Mailroom; a bot nobody knows has none
+    // the page: Chat unless a tab this bot has is asked for; the uberbot's bar folds Status under Mailroom, Tasks under Browser, and Hooks under Settings without repeating the parent tab; a bot nobody knows has none
     let p = crate::bots::bot_page(&hub, &u, "", 10).await.unwrap(); assert_eq!((p["tab"].as_str(), p["navTab"].as_str(), p["uber"].as_bool()), (Some("chat"), Some("chat"), Some(true)));
-    let p = crate::bots::bot_page(&hub, &u, "status", 10).await.unwrap(); assert_eq!((p["tab"].as_str(), p["navTab"].as_str(), p["subtabs"].as_array().unwrap().len()), (Some("status"), Some("mail"), 2));
+    let p = crate::bots::bot_page(&hub, &u, "browser", 10).await.unwrap();
+    let sub_ids = |v: &Value| v["subtabs"].as_array().unwrap().iter().map(|t| t["id"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!((p["tab"].as_str(), p["navTab"].as_str(), sub_ids(&p)), (Some("browser"), Some("browser"), vec!["tasks".to_string()]));
+    let p = crate::bots::bot_page(&hub, &u, "tasks", 10).await.unwrap();
+    assert_eq!((p["tab"].as_str(), p["navTab"].as_str(), sub_ids(&p)), (Some("tasks"), Some("browser"), vec!["tasks".to_string()]));
+    let p = crate::bots::bot_page(&hub, &u, "status", 10).await.unwrap();
+    assert_eq!((p["tab"].as_str(), p["navTab"].as_str(), sub_ids(&p)), (Some("status"), Some("mail"), vec!["status".to_string()]));
+    let p = crate::bots::bot_page(&hub, &u, "hooks", 10).await.unwrap();
+    assert_eq!((p["tab"].as_str(), p["navTab"].as_str(), sub_ids(&p)), (Some("hooks"), Some("settings"), vec!["hooks".to_string()]));
     let p = crate::bots::bot_page(&hub, &a, "status", 10).await.unwrap(); assert_eq!(p["tab"], "chat", "a plain bot has no Status");
     assert!(crate::bots::bot_page(&hub, "nope", "", 10).await.is_none());
     hub.commit(&json!({"$":"MemorySaved","bot":a,"key":"k","kind":"fact","text":"t","tags":"","at":5})).await.unwrap();
