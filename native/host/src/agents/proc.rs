@@ -36,7 +36,9 @@ impl Cli {
                 if exec && cp.starts_with(&cd) { Ok(cp) } else { Err(format!("{} has no runnable {cli}", d.display())) }
             }
             None if self.copy => Err(format!("a copy of a log runs agents only as stand-ins: {cli} refused")),
-            None => find_in(search_dirs(), cli, cfg!(windows)).ok_or_else(|| format!("{cli} is not installed (looked in the hub's PATH, the login shell's and the usual install directories)")),
+            None => find_in(search_dirs(), cli, cfg!(windows))
+                .or_else(|| (cfg!(windows) && cli == "codex").then(|| find_in(&windows_store_codex_dirs(), cli, true)).flatten())
+                .ok_or_else(|| format!("{cli} is not installed (looked in the hub's PATH, the login shell's and the usual install directories)")),
         }
     }
     /// The PATH a probe of an agent CLI runs with (`--version`, its model list), the one a turn gets: the merged search directories, or in test mode the
@@ -46,7 +48,14 @@ impl Cli {
         match &self.dir {
             Some(d) => std::env::join_paths(std::iter::once(d.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()))).ok(),
             None if self.copy => None,
-            None => std::env::join_paths(search_dirs()).ok(),
+            None => {
+                let extra = if cfg!(windows) { windows_store_codex_dirs() } else { vec![] };
+                if extra.is_empty() {
+                    std::env::join_paths(search_dirs()).ok()
+                } else {
+                    std::env::join_paths(merge_dirs(&[search_dirs().to_vec(), extra])).ok()
+                }
+            }
         }
     }
 }
@@ -63,8 +72,90 @@ pub const AGENT_DIRS: [&str; 8] = [".claude/local", ".local/bin", ".grok/bin", "
 /// CliPath.merge: each directory once, the first of each, in order, none empty.
 pub fn merge_dirs(parts: &[Vec<PathBuf>]) -> Vec<PathBuf> { let mut out: Vec<PathBuf> = vec![]; for d in parts.iter().flatten() { if !d.as_os_str().is_empty() && !out.contains(d) { out.push(d.clone()) } } out }
 fn semver_key(s: &str) -> (u64, u64, u64) { let mut p = s.trim_start_matches('v').split('.').map(|x| x.parse::<u64>().unwrap_or(0)); (p.next().unwrap_or(0), p.next().unwrap_or(0), p.next().unwrap_or(0)) }
+const OPENAI_CODEX_STORE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
+
+/// Resources folder inside an installed Microsoft Store `OpenAI.Codex` package where `codex.exe` lives.
+pub fn store_codex_resources_dir(package_root: &Path) -> PathBuf {
+    package_root.join("app").join("resources")
+}
+
+#[cfg(windows)]
+fn windows_store_package_roots(family: &str) -> Vec<PathBuf> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+    use windows_sys::Win32::Storage::Packaging::Appx::{
+        FindPackagesByPackageFamily, GetPackagePathByFullName, PACKAGE_FILTER_HEAD,
+    };
+
+    // Query AppModel package registration via user-mode kernel32 APIs so standard accounts never need WindowsApps directory listing or elevation.
+    let fam_w: Vec<u16> = family.encode_utf16().chain(std::iter::once(0)).collect();
+    let (mut count, mut buf_len) = (0u32, 0u32);
+    let rc = unsafe {
+        FindPackagesByPackageFamily(
+            fam_w.as_ptr(),
+            PACKAGE_FILTER_HEAD,
+            &mut count,
+            std::ptr::null_mut(),
+            &mut buf_len,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != ERROR_INSUFFICIENT_BUFFER || count == 0 || buf_len == 0 {
+        return vec![];
+    }
+    let mut names: Vec<windows_sys::core::PWSTR> = vec![std::ptr::null_mut(); count as usize];
+    let mut buf: Vec<u16> = vec![0u16; buf_len as usize];
+    let rc = unsafe {
+        FindPackagesByPackageFamily(
+            fam_w.as_ptr(),
+            PACKAGE_FILTER_HEAD,
+            &mut count,
+            names.as_mut_ptr(),
+            &mut buf_len,
+            buf.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != ERROR_SUCCESS || count == 0 {
+        return vec![];
+    }
+    let n = (count as usize).min(names.len());
+    let mut roots = Vec::new();
+    for &ptr in &names[..n] {
+        if ptr.is_null() { continue }
+        let mut path_len = 0u32;
+        let rc = unsafe { GetPackagePathByFullName(ptr as *const u16, &mut path_len, std::ptr::null_mut()) };
+        if rc != ERROR_INSUFFICIENT_BUFFER || path_len == 0 { continue }
+        let mut path_buf = vec![0u16; path_len as usize];
+        let rc = unsafe { GetPackagePathByFullName(ptr as *const u16, &mut path_len, path_buf.as_mut_ptr()) };
+        if rc == ERROR_SUCCESS {
+            let end = path_buf.iter().position(|&c| c == 0).unwrap_or(path_buf.len());
+            if end > 0 {
+                roots.push(PathBuf::from(String::from_utf16_lossy(&path_buf[..end])));
+            }
+        }
+    }
+    roots
+}
+
+#[cfg(not(windows))]
+fn windows_store_package_roots(_: &str) -> Vec<PathBuf> { vec![] }
+
+/// Existing `app/resources` directories of installed Microsoft Store `OpenAI.Codex` (ChatGPT/Codex Desktop) packages.
+pub fn windows_store_codex_dirs() -> Vec<PathBuf> {
+    windows_store_package_roots(OPENAI_CODEX_STORE_FAMILY)
+        .into_iter()
+        .map(|root| store_codex_resources_dir(&root))
+        .filter(|d| d.is_dir())
+        .collect()
+}
+
 /// CliPath.usual: the usual install directories that exist, for this platform (see [`usual_dirs_for`]).
-pub fn usual_dirs(home: &Path) -> Vec<PathBuf> { usual_dirs_for(home, cfg!(windows), cfg!(target_os = "macos"), &|k| std::env::var_os(k).filter(|v| !v.is_empty())) }
+pub fn usual_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = usual_dirs_for(home, cfg!(windows), cfg!(target_os = "macos"), &|k| std::env::var_os(k).filter(|v| !v.is_empty()));
+    for d in windows_store_codex_dirs() { if !dirs.contains(&d) { dirs.push(d); } }
+    dirs
+}
 /// Each node version folder under `root` (`v24.13.1`, `24.13.1`...), newest first, joined with `tail`.
 fn node_versions(root: &Path, tail: &str) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(root) else { return vec![] };
@@ -610,6 +701,18 @@ mod tests {
         std::fs::write(roam.join("npm/opencode.cmd"), "@echo off").unwrap(); std::fs::write(h.join(".grok/bin/grok.exe"), "MZ").unwrap(); std::fs::write(h.join(".pi/agent/bin/pi.cmd"), "@echo off").unwrap();
         assert_eq!(find_in(&u, "opencode", true), Some(roam.join("npm/opencode.cmd"))); assert_eq!(find_in(&u, "grok", true), Some(h.join(".grok/bin/grok.exe"))); assert_eq!(find_in(&u, "pi", true), Some(h.join(".pi/agent/bin/pi.cmd")));
         assert_eq!(find_in(&u, "opencode", false), None, "a .cmd is a program only on Windows");
+    }
+    #[test] fn windows_store_codex_resources_dir_points_to_app_resources() {
+        let root = Path::new("C:/Program Files/WindowsApps/OpenAI.Codex_26.1120.6357.0_x64__2p2nqsd0c76g0");
+        assert_eq!(store_codex_resources_dir(root), root.join("app").join("resources"));
+    }
+    #[cfg(windows)]
+    #[test] fn windows_store_package_lookup_runs_unprivileged() {
+        assert!(windows_store_package_roots("NonExistent.BackplaneTest_0000000000000").is_empty());
+        for d in windows_store_codex_dirs() {
+            assert!(d.ends_with(Path::new("app").join("resources")), "{d:?}");
+            assert!(d.is_dir(), "{d:?}");
+        }
     }
     #[test] fn the_path_is_read_between_its_marks() {
         assert_eq!(marked_path("Welcome!\n__BP_PATH__/a:/b__BP_END__\nbye\n"), Some("/a:/b"));
