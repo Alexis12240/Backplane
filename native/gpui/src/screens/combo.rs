@@ -66,22 +66,35 @@ pub fn usage_rows(combo: &Value) -> (Vec<UsageRow>, Vec<String>) {
     (rows, notes)
 }
 
+/// Whether the thread shows the Account/Usage section in the combo menu.
+pub fn accounts_enabled(thread: &Value) -> bool {
+    thread.is_object()
+        && (matches!(thread["provider"].as_str().map(super::picker::bare), Some("claude" | "codex"))
+            || thread["combo"]["account"].as_str().map_or(false, |a| !a.is_empty()))
+}
+/// Whether the composer shows the provider/model chip (`#model-chip`). Hidden when no thread is open so a placeholder Claude badge is never shown.
+pub fn chip_visible(thread: &Value) -> bool { thread.is_object() }
+/// Whether the combo menu can open with content (either model picker rows or account/usage rows).
+pub fn menu_enabled(thread: &Value) -> bool { super::picker::has_picker(thread) || accounts_enabled(thread) }
+
 /// The chip. `avail`: the px the row leaves it (0: not measured yet). `menu_open`: its menu is up, so its hover stays away (it would sit over the menu's Account row).
-pub fn chip(cx: &mut Context<Backplane>, light: bool, thread: &Value, avail: f32, keys: (&str, &str), this_chip: &Rc<Cell<Bounds<Pixels>>>, menu_open: bool) -> Stateful<Div> {
+pub fn chip(cx: &mut Context<Backplane>, light: bool, thread: &Value, avail: f32, keys: (&str, &str), this_chip: &Rc<Cell<Bounds<Pixels>>>, menu_open: bool) -> Option<Stateful<Div>> {
+    if !chip_visible(thread) { return None }
     let c = |n: &str| theme::color(light, n);
     let combo = &thread["combo"];
     let provider = super::picker::bare(thread["provider"].as_str().or(thread["picker"]["providers"].as_array().and_then(|p| p.iter().find(|x| x["on"] == true)).and_then(|x| x["value"].as_str())).unwrap_or("claude")).to_string();
     let text = words(combo, avail);
     let text = if text.is_empty() { "…".to_string() } else { text };
     let tipped = tip(combo, keys.0, keys.1);
+    let interactive = menu_enabled(thread);
     // where it was drawn: a press on it is the chip's own (it shuts the menu), not a press outside the menu
     let at = this_chip.clone();
-    div().id("model-chip").relative().cursor_pointer().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().px_3().py_1().border_1().border_color(c("line")).bg(c("panel")).hover(|s| s.bg(c("raise")))
+    Some(div().id("model-chip").relative().when(interactive, |d| d.cursor_pointer().hover(|s| s.bg(c("raise")))).flex_1().min_w_0().overflow_hidden().whitespace_nowrap().px_3().py_1().border_1().border_color(c("line")).bg(c("panel"))
         .text_size(crate::scale::tpx(12.)).font(crate::art::mono_font()).flex().items_center().gap_2()
         .child(canvas(move |b, _, _| at.set(b), |_, _, _, _| {}).absolute().top_0().left_0().size_full()).child(crate::art::probe("modelchip"))
         .child(super::picker::logo(&provider)).child(div().min_w_0().overflow_hidden().text_ellipsis().text_color(c(tone(combo))).child(text))
         .when(!tipped.is_empty() && !menu_open, |d| d.tooltip(move |_, cx| cx.new(|_| Tip(tipped.clone(), light)).into()))
-        .on_click(cx.listener(|this, _, window, cx| this.combo_click(window, cx)))
+        .when(interactive, |d| d.on_click(cx.listener(|this, _, window, cx| this.combo_click(window, cx)))))
 }
 /// A hover of several lines.
 pub(crate) struct Tip(pub String, pub bool);
@@ -128,7 +141,8 @@ pub fn menu(cx: &mut Context<Backplane>, light: bool, thread: &Value, this: &Bac
     let z = |v: f32| px(v * f.s);
     let model = super::picker::view(cx, light, thread, true, &this.screens.pick, &this.local.favs, &f);
     let st = &this.screens.acct;
-    let accounts_on = matches!(thread["provider"].as_str().map(super::picker::bare), Some("claude" | "codex")) || thread["combo"]["account"].as_str().map_or(false, |a| !a.is_empty());
+    let accounts_on = accounts_enabled(thread);
+    if model.is_none() && !accounts_on { crate::art::forget("chipmenu"); return None }
     let head = |t: &str, hint: String, on: bool| div().px_3().pt_2().pb_1().flex().justify_between().text_size(z(11.)).text_color(c(if on { "accent" } else { "faint" })).child(crate::i18n::trs(t).to_uppercase()).child(hint);
     let mut side = div().flex().flex_col().min_w_0();
     if accounts_on {
@@ -176,8 +190,17 @@ impl Backplane {
     /// The model key: the menu with the keyboard in its search; pressed with the keyboard already there, it shuts.
     pub(crate) fn combo_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screens.picker_open && !self.screens.acct.menu { self.picker_close(cx); return }
+        if !menu_enabled(&self.data["thread"]) { return }
         self.screens.acct.menu = false;
-        self.picker_show(window, cx);
+        if super::picker::has_picker(&self.data["thread"]) {
+            self.picker_show(window, cx);
+        } else {
+            self.screens.picker_open = true;
+            self.screens.acct.menu = true;
+            let h = self.screens.acct.focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            window.focus(&h);
+            cx.notify();
+        }
         accounts::list(self); accounts::refresh_usage(self);
     }
     /// Something drawn over the page (the palette, a picture, Settings, the tour, a 0.14 home coming across): the menu stays open but is not drawn over it.
@@ -192,10 +215,19 @@ impl Backplane {
     /// The account key: the menu with the keyboard on the accounts (their digits pick); pressed with the keyboard already there, it shuts.
     pub(crate) fn combo_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.screens.picker_open && self.screens.acct.menu { self.picker_close(cx); return }
-        if !self.screens.picker_open { self.picker_show(window, cx); }
-        self.screens.acct.menu = true; self.screens.acct.notice.clear();
+        if !menu_enabled(&self.data["thread"]) { return }
+        if !self.screens.picker_open {
+            if super::picker::has_picker(&self.data["thread"]) {
+                self.picker_show(window, cx);
+            } else {
+                self.screens.picker_open = true; self.screens.pick.cur = None; self.screens.pick.held.set([0.; 3]);
+            }
+        }
+        if accounts_enabled(&self.data["thread"]) {
+            self.screens.acct.menu = true; self.screens.acct.notice.clear();
+            let h = self.screens.acct.focus.get_or_insert_with(|| cx.focus_handle()).clone(); window.focus(&h);
+        }
         accounts::list(self); accounts::refresh_usage(self);
-        let h = self.screens.acct.focus.get_or_insert_with(|| cx.focus_handle()).clone(); window.focus(&h);
         cx.notify();
     }
 }
@@ -255,5 +287,16 @@ mod tests {
         let (rows, notes) = usage_rows(&combo());
         assert_eq!(rows[0], UsageRow { label: "Weekly".into(), left: "36% left".into(), resets: "resets Wed 11 Nov 17:00".into(), tone: "text", applies: true });
         assert!(!rows[1].applies && rows[1].resets.is_empty()); assert_eq!(notes, ["Extra usage $0.00 of $50.00 · off (out of credits)"]);
+    }
+    #[test] fn no_thread_hides_the_chip_and_disables_the_menu() {
+        assert!(!chip_visible(&Value::Null));
+        assert!(!menu_enabled(&Value::Null));
+        assert!(!accounts_enabled(&Value::Null));
+        assert!(!menu_enabled(&json!({})));
+        assert!(chip_visible(&json!({})));
+        assert!(menu_enabled(&json!({"provider": "claude"})));
+        assert!(accounts_enabled(&json!({"provider": "@codex"})));
+        assert!(!accounts_enabled(&json!({"provider": "antigravity"})));
+        assert!(menu_enabled(&json!({"provider": "antigravity", "picker": {"providers": [{"value": "@antigravity", "label": "antigravity", "on": true}]}})));
     }
 }

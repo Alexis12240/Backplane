@@ -395,9 +395,12 @@ pub fn arrange(sections: &[Section], provider: &str, q: &str, favs: &[String], k
     }).collect();
     (out, hidden)
 }
+/// Whether `thread` carries model/agent picker data from the hub.
+pub fn has_picker(thread: &Value) -> bool { thread.is_object() && !parse(&thread["picker"]).is_empty() }
 /// The menu as it stands: the thread's own cursor, the cursor, every row for its agent, the rows on show and how many models the cap left out.
 pub struct Shown { pub own: Cursor, pub cur: Cursor, pub all: Vec<Section>, pub rows: Vec<Section>, pub hidden: usize }
 pub fn shown(thread: &Value, pick: &Pick, favs: &[String]) -> Option<Shown> {
+    if !has_picker(thread) { return None }
     let mine = parse(&thread["picker"]);
     if mine.is_empty() { return None }
     let own = Cursor::own(&mine); let id = string(thread, "id");
@@ -685,6 +688,7 @@ impl Backplane {
     }
     /// Open the menu (screens/combo.rs) with the keyboard in the model search.
     pub(crate) fn picker_show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !has_picker(&self.data["thread"]) { return }
         self.screens.picker_open = true; self.screens.pick.cur = None; self.screens.pick.held.set([0.; 3]);
         if self.screens.pick.search.is_none() {
             let input = cx.new(|cx| Composer::with_context(cx, "PickInput"));
@@ -1104,5 +1108,12 @@ mod tests {
         let filtered = favorite_items(&thread, &["claude/opus".into(), "codex/gpt".into()], "fast");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].key, "codex/gpt");
+    }
+    #[test] fn has_picker_rejects_null_and_empty_threads() {
+        assert!(!has_picker(&Value::Null));
+        assert!(!has_picker(&serde_json::json!({})));
+        assert!(!has_picker(&serde_json::json!({"id": "t1", "picker": {}})));
+        let (p, _) = fixture();
+        assert!(has_picker(&serde_json::json!({"id": "t1", "picker": p})));
     }
 }
