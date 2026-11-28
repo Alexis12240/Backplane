@@ -545,4 +545,5 @@ fn drive_pump<T: 'static>(cx: &mut Context<T>) {
         }
     }).detach();
 }
+pub fn engine_port_ready() -> Option<Result<u16, String>> { Engine::try_get().map(|r| match r { Ok(e) => Ok(e.cdp_port), Err(e) => Err(e.clone()) }) }
 pub fn engine_port() -> Result<u16, String> { match Engine::get() { Ok(e) => Ok(e.cdp_port), Err(e) => Err(e.clone()) } }

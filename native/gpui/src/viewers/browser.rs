@@ -18,7 +18,42 @@ pub fn decode_jpeg(bytes: &[u8]) -> Option<Arc<RenderImage>> {
 }
 fn fnv(bytes: &[u8]) -> u64 { bytes.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3)) }
 
-pub struct BrowserPage { pub header_owner: Option<WeakEntity<crate::Backplane>>, #[cfg(feature = "cef")] pub cef: Option<Entity<super::cef_page::CefPage>>, bar: Bar, banner: String, pub light: bool, open_error: Option<String>, opening_since: Instant, image: Option<Arc<RenderImage>>, retired: Vec<Arc<RenderImage>>, pub status: String, stop: Arc<AtomicBool>, visible: Arc<AtomicBool>, hub_at: (String, String) }
+#[cfg_attr(not(feature = "cef"), allow(dead_code))]
+pub(crate) fn async_engine_init(external_pump: bool, engine_ready: bool) -> bool { !external_pump && !engine_ready }
+
+#[cfg_attr(not(feature = "cef"), allow(dead_code))]
+fn fallback_banner(err: &str) -> (String, String) {
+    (format!("embedded browser unavailable: {err}"), format!("Embedded browser unavailable ({err}); showing the hub's frames.")) /* i18n-ok: drawn through trs */
+}
+
+fn spawn_poller(base: String, owner: String, token: String, hub_open: tokio::sync::mpsc::Sender<crate::hub::Command>, flag: Arc<AtomicBool>, vis: Arc<AtomicBool>, tx: async_channel::Sender<Result<Option<Arc<RenderImage>>, String>>) {
+    std::thread::Builder::new().name("browser-frames".into()).spawn(move || {
+        let url = format!("{}/bots/{}/screen.jpg", base.trim_end_matches('/'), owner);
+        let (mut last, mut failing) = (0u64, false); let mut opened: Option<std::time::Instant> = None;
+        while !flag.load(Ordering::Relaxed) {
+            if !vis.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(POLL_MS)); continue } // another tab is shown: no requests
+            let out = match get_bytes(&url, &token, Duration::from_secs(3), MAX_JPEG) {
+                Ok((200, body)) => {
+                    if fnv(&body) == last { if failing { failing = false; Some(Ok(None)) } else { None } } // the same frame: nothing to draw (but a recovery clears the status)
+                    /* i18n-ok: the status is kept in English (the e2e report reads it) and drawn through trs */ else { last = fnv(&body); failing = false; Some(decode_jpeg(&body).map(Some).ok_or_else(|| "frame is not a JPEG".to_string())) }
+                }
+                Ok((404, _)) => {
+                    // no page exists for this owner yet: ask the hub to open one (at most every 5 s), its first frame follows
+                    if opened.map_or(true, |t| t.elapsed() > Duration::from_secs(5)) { opened = Some(std::time::Instant::now());
+                        let _ = hub_open.try_send(crate::hub::Command::Rpc("bots.browser".into(), crate::screens::settings::Secret(serde_json::json!({"bot": owner, "op": "open"})), "browser")); }
+                    /* i18n-ok: compared below, drawn through trs */ Some(Err("Opening the browser…".into()))
+                }
+                /* i18n-ok: drawn through trs */ Ok((c, _)) => Some(Err(format!("hub answered {c}"))),
+                /* i18n-ok: drawn through trs */ Err(e) => Some(Err(format!("hub unreachable: {e}"))),
+            };
+            if matches!(out, Some(Err(_))) { failing = true; }
+            if let Some(msg) = out { if tx.try_send(msg).is_err() && tx.is_closed() { return } }
+            std::thread::sleep(Duration::from_millis(POLL_MS));
+        }
+    }).ok();
+}
+
+pub struct BrowserPage { pub header_owner: Option<WeakEntity<crate::Backplane>>, #[cfg(feature = "cef")] pub cef: Option<Entity<super::cef_page::CefPage>>, cef_starting: bool, #[cfg(feature = "cef")] cef_hub: tokio::sync::mpsc::Sender<crate::hub::Command>, #[cfg(feature = "cef")] cef_owner: String, #[cfg(feature = "cef")] cef_start_url: Option<String>, #[cfg(feature = "cef")] cef_tx: async_channel::Sender<Result<Option<Arc<RenderImage>>, String>>, bar: Bar, banner: String, pub light: bool, open_error: Option<String>, opening_since: Instant, image: Option<Arc<RenderImage>>, retired: Vec<Arc<RenderImage>>, pub status: String, stop: Arc<AtomicBool>, visible: Arc<AtomicBool>, hub_at: (String, String) }
 /// The hub's copy of a person's download (`/browser-download?id=`) written to `dir` under a name not taken there: what the page says after.
 pub fn save_download(base: &str, token: &str, id: &str, name: &str, dir: &std::path::Path) -> String {
     let url = format!("{}/browser-download?id={id}", base.trim_end_matches('/'));
@@ -63,46 +98,76 @@ impl BrowserPage {
     /// `set_visible(true)`; mount the page with the tab and call `set_visible(false)` when another tab is shown.
     pub fn new(cx: &mut Context<Self>, base: String, owner: String, token: String, hub: tokio::sync::mpsc::Sender<crate::hub::Command>) -> Self {
         let hub_tx = hub.clone(); let owner_bar = owner.clone(); let hub_at = (base.clone(), token.clone());
-        // with the `cef` feature and a usable runtime the page is embedded Chromium (cef_page.rs); otherwise the hub's JPEG frames below
-        #[cfg(feature = "cef")]
-        let mut cef_why = String::new();
-        #[cfg(feature = "cef")]
-        let (cef, cef_note) = match super::cef_page::engine_port() {
-            Ok(port) => { let o = owner.clone(); (Some(cx.new(move |cx| super::cef_page::CefPage::new(cx, o, hub, port))), String::new()) }
-            Err(e) => { eprintln!("GPUI_LOG {{\"cef\":{}}}", serde_json::Value::String(e.clone())); cef_why = format!("embedded browser unavailable: {e}"); (None, format!("Embedded browser unavailable ({e}); showing the hub's frames.")) }
-        };
-        #[cfg(feature = "cef")]
-        let use_poller = cef.is_none();
-        #[cfg(not(feature = "cef"))]
-        let use_poller = true;
         let https = base.starts_with("https://");
         let stop = Arc::new(AtomicBool::new(false)); let visible = Arc::new(AtomicBool::new(false)); let vis = visible.clone(); // fetches only after set_visible(true)
         let (tx, rx) = async_channel::bounded::<Result<Option<Arc<RenderImage>>, String>>(2); // Ok(None): a good fetch of the frame already shown
-        let flag = stop.clone(); let hub_open = hub_tx.clone();
-        let _ = https; if use_poller { std::thread::Builder::new().name("browser-frames".into()).spawn(move || {
-            let url = format!("{}/bots/{}/screen.jpg", base.trim_end_matches('/'), owner);
-            let (mut last, mut failing) = (0u64, false); let mut opened: Option<std::time::Instant> = None;
-            while !flag.load(Ordering::Relaxed) {
-                if !vis.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(POLL_MS)); continue } // another tab is shown: no requests
-                let out = match get_bytes(&url, &token, Duration::from_secs(3), MAX_JPEG) {
-                    Ok((200, body)) => {
-                        if fnv(&body) == last { if failing { failing = false; Some(Ok(None)) } else { None } } // the same frame: nothing to draw (but a recovery clears the status)
-                        /* i18n-ok: the status is kept in English (the e2e report reads it) and drawn through trs */ else { last = fnv(&body); failing = false; Some(decode_jpeg(&body).map(Some).ok_or_else(|| "frame is not a JPEG".to_string())) }
-                    }
-                    Ok((404, _)) => {
-                        // no page exists for this owner yet: ask the hub to open one (at most every 5 s), its first frame follows
-                        if opened.map_or(true, |t| t.elapsed() > Duration::from_secs(5)) { opened = Some(std::time::Instant::now());
-                            let _ = hub_open.try_send(crate::hub::Command::Rpc("bots.browser".into(), crate::screens::settings::Secret(serde_json::json!({"bot": owner, "op": "open"})), "browser")); }
-                        /* i18n-ok: compared below, drawn through trs */ Some(Err("Opening the browser…".into()))
-                    }
-                    /* i18n-ok: drawn through trs */ Ok((c, _)) => Some(Err(format!("hub answered {c}"))),
-                    /* i18n-ok: drawn through trs */ Err(e) => Some(Err(format!("hub unreachable: {e}"))),
-                };
-                if matches!(out, Some(Err(_))) { failing = true; }
-                if let Some(msg) = out { if tx.try_send(msg).is_err() && tx.is_closed() { return } }
-                std::thread::sleep(Duration::from_millis(POLL_MS));
+        // with the `cef` feature and a usable runtime the page is embedded Chromium (cef_page.rs); otherwise the hub's JPEG frames below
+        #[cfg(feature = "cef")]
+        let (cef, cef_starting, cef_why, cef_note, use_poller) = match super::cef_page::engine_port_ready() {
+            Some(Ok(port)) => {
+                let o = owner.clone(); let h = hub.clone();
+                (Some(cx.new(move |cx| super::cef_page::CefPage::new(cx, o, h, port))), false, String::new(), String::new(), false)
             }
-        }).ok(); }
+            Some(Err(e)) => {
+                eprintln!("GPUI_LOG {{\"cef\":{}}}", serde_json::Value::String(e.clone()));
+                let (why, note) = fallback_banner(&e);
+                (None, false, why, note, true)
+            }
+            None if async_engine_init(super::cef::EXTERNAL_PUMP, false) => {
+                let (init_tx, init_rx) = async_channel::bounded::<Result<u16, String>>(1);
+                let _ = std::thread::Builder::new().name("cef-init".into()).spawn(move || { let _ = init_tx.try_send(super::cef_page::engine_port()); });
+                cx.spawn(async move |weak, cx| {
+                    let Ok(res) = init_rx.recv().await else { return };
+                    let _ = weak.update(cx, |this, cx| {
+                        this.cef_starting = false;
+                        match res {
+                            Ok(port) => {
+                                let o = this.cef_owner.clone(); let h = this.cef_hub.clone();
+                                let page = cx.new(move |cx| super::cef_page::CefPage::new(cx, o, h, port));
+                                let header_owner = this.header_owner.clone();
+                                let light = this.light;
+                                let start = this.cef_start_url.clone();
+                                let vis_now = this.visible.load(Ordering::Relaxed);
+                                page.update(cx, |p, cx| {
+                                    p.header_owner = header_owner;
+                                    if p.light != light { p.light = light; }
+                                    if let Some(s) = start { p.start = s; }
+                                    p.set_visible(vis_now);
+                                    cx.notify();
+                                });
+                                this.banner.clear();
+                                this.status.clear();
+                                this.cef = Some(page);
+                            }
+                            Err(e) => {
+                                eprintln!("GPUI_LOG {{\"cef\":{}}}", serde_json::Value::String(e.clone()));
+                                let (why, note) = fallback_banner(&e);
+                                this.banner = why;
+                                this.status = note;
+                                this.opening_since = Instant::now();
+                                spawn_poller(this.hub_at.0.clone(), this.cef_owner.clone(), this.hub_at.1.clone(), this.cef_hub.clone(), this.stop.clone(), this.visible.clone(), this.cef_tx.clone());
+                            }
+                        }
+                        cx.notify();
+                    });
+                }).detach();
+                (None, true, String::new(), "Opening the browser…".to_string(), false) /* i18n-ok: drawn through trs */
+            }
+            None => match super::cef_page::engine_port() {
+                Ok(port) => {
+                    let o = owner.clone(); let h = hub.clone();
+                    (Some(cx.new(move |cx| super::cef_page::CefPage::new(cx, o, h, port))), false, String::new(), String::new(), false)
+                }
+                Err(e) => {
+                    eprintln!("GPUI_LOG {{\"cef\":{}}}", serde_json::Value::String(e.clone()));
+                    let (why, note) = fallback_banner(&e);
+                    (None, false, why, note, true)
+                }
+            }
+        };
+        #[cfg(not(feature = "cef"))]
+        let (cef_starting, use_poller) = (false, true);
+        let _ = https; if use_poller { spawn_poller(base, owner.clone(), token, hub_tx.clone(), stop.clone(), vis, tx.clone()); }
         cx.spawn(async move |weak, cx| {
             while let Ok(msg) = rx.recv().await {
                 if weak.update(cx, |this, cx| { match msg { Ok(Some(i)) => { if let Some(old) = this.image.replace(i) { this.retired.push(old); } this.status.clear(); } Ok(None) => this.status.clear(), Err(e) => this.status = e } cx.notify(); }).is_err() { break }
@@ -114,12 +179,12 @@ impl BrowserPage {
         let cef_note2 = String::new();
         // why this is the hub-frame fallback, said in the tab for as long as it is (never silently a slower browser)
         #[cfg(feature = "cef")]
-        let banner = cef_why.clone();
+        let banner = cef_why;
         // a build without CEF draws the hub's frames by design (0.15: macOS and Windows), not a fallback to warn about; Settings > About says which
         #[cfg(not(feature = "cef"))]
         let banner = String::new();
         /* i18n-ok: the status is drawn through trs */ let status = if !cef_note2.is_empty() { cef_note2 } else if https { "https hubs are not supported by this page yet (the client has no TLS)".to_string() } else { "Waiting for the first frame".to_string() };
-        BrowserPage { header_owner: None, #[cfg(feature = "cef")] cef, bar: Bar::new(cx, hub_tx.clone(), owner_bar), banner, light: false, open_error: None, opening_since: Instant::now(), image: None, retired: Vec::new(), status, stop, visible, hub_at }
+        BrowserPage { header_owner: None, #[cfg(feature = "cef")] cef, cef_starting, #[cfg(feature = "cef")] cef_hub: hub, #[cfg(feature = "cef")] cef_owner: owner, #[cfg(feature = "cef")] cef_start_url: None, #[cfg(feature = "cef")] cef_tx: tx, bar: Bar::new(cx, hub_tx, owner_bar), banner, light: false, open_error: None, opening_since: Instant::now(), image: None, retired: Vec::new(), status, stop, visible, hub_at }
     }
     /// A download the person started on this page (the hub's `browser.download`): fetched from the hub and saved in Downloads under a name not taken
     /// (as the embedded browser saves its own); the note line says where, or why not.
@@ -147,7 +212,9 @@ impl BrowserPage {
     /// The start page a new or empty tab opens (the hub's `browserStart`, Settings › Browser): only embedded Chromium opens tabs itself.
     pub fn set_start(&mut self, start: &str, cx: &mut Context<Self>) {
         #[cfg(feature = "cef")]
-        if let Some(c) = &self.cef { let start = start.to_string(); c.update(cx, |p, _| p.start = start); }
+        if let Some(c) = &self.cef { let start = start.to_string(); c.update(cx, |p, _| p.start = start); return }
+        #[cfg(feature = "cef")]
+        { self.cef_start_url = Some(start.to_string()); }
         #[cfg(not(feature = "cef"))]
         let _ = (start, cx);
     }
@@ -158,6 +225,7 @@ impl BrowserPage {
     pub(crate) fn settled(&self, _cx: &App) -> Option<&'static str> {
         #[cfg(feature = "cef")]
         if let Some(page) = &self.cef { return page.read(_cx).settled(); }
+        if self.cef_starting { return None }
         if self.image.is_some() { return Some(if self.status.is_empty() { "ready" } else { "error" }); }
         open_message(&self.open_error, self.opening_since.elapsed()).map(|_| "error")
     }
@@ -218,8 +286,8 @@ impl Render for BrowserPage {
             Some(i) => div().id("browser-view").size_full().relative().bg(c("bg")).child(img(i.clone()).size_full().object_fit(ObjectFit::Contain))
                 .when(!status.is_empty(), |d| d.child(div().absolute().bottom_2().left_2().px_2().py_1().text_size(crate::scale::tpx(12.)).bg(c("panel")).border_1().border_color(c("line")).text_color(c("bad")).child(trs(&status)))).into_any_element(),
             None => {
-                let said = open_message(&self.open_error, self.opening_since.elapsed());
-                let waiting = said.is_none() && status == "Opening the browser…";
+                let said = if self.cef_starting { None } else { open_message(&self.open_error, self.opening_since.elapsed()) };
+                let waiting = !self.cef_starting && said.is_none() && status == "Opening the browser…";
                 let line = said.as_ref().map(|m| m.0.clone()).unwrap_or_else(|| status.clone());
                 div().id("browser-view").size_full().bg(c("bg")).flex().flex_col().items_center().justify_center().gap_3().px_6().text_size(crate::scale::tpx(13.)).text_color(c("dim"))
                     .child(div().max_w(px(480.)).text_color(c(if said.is_some() { "text" } else { "dim" })).child(trs(&line)))
@@ -412,4 +480,12 @@ mod tests {
     }
     #[test] fn refuses_bytes_that_are_not_a_jpeg() { assert!(decode_jpeg(b"not a jpeg").is_none()); assert!(decode_jpeg(&[]).is_none()); }
     #[test] fn the_same_bytes_hash_the_same_and_a_new_frame_differs() { let a = jpeg(8, 8, [1, 2, 3]); assert_eq!(fnv(&a), fnv(&a.clone())); assert_ne!(fnv(&a), fnv(&jpeg(8, 8, [200, 2, 3]))); }
+    #[test] fn cef_engine_init_is_off_ui_thread_only_when_external_pump_is_off_and_uninitialized() {
+        assert!(super::async_engine_init(false, false));
+        assert!(!super::async_engine_init(false, true));
+        assert!(!super::async_engine_init(true, false));
+        assert!(!super::async_engine_init(true, true));
+        let (why, note) = super::fallback_banner("missing");
+        assert!(why.contains("missing") && note.contains("missing"));
+    }
 }

@@ -582,6 +582,7 @@ mod imp {
     use windows_sys::Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{GetDC, GetPixel, ReleaseDC, ScreenToClient},
+        System::Threading::{AttachThreadInput, GetCurrentThreadId},
         UI::{
             Input::KeyboardAndMouse::{GetAsyncKeyState, GetFocus, SetFocus},
             WindowsAndMessaging::*,
@@ -838,8 +839,127 @@ mod imp {
         PRESS.lock().unwrap().clear_target_up_to(w, max_seq);
     }
 
+    /// Off-UI-thread placement queue for CEF child HWNDs (reusing native_child::placeq): even SWP_ASYNCWINDOWPOS
+    /// waits on Chromium's UI thread from the parent HWND's thread because their Win32 input queues are joined.
+    mod placer {
+        use crate::viewers::native_child::placeq::{still_ours, work, Job, Q};
+        use std::{collections::HashMap, sync::{Arc, Condvar, Mutex, OnceLock}, time::Duration};
+        type W = Arc<(Mutex<Q>, Condvar)>;
+        fn workers() -> &'static Mutex<HashMap<u32, W>> { static M: OnceLock<Mutex<HashMap<u32, W>>> = OnceLock::new(); M.get_or_init(Default::default) }
+        fn owner(w: u64) -> (u32, u32) { let mut pid = 0u32; let t = unsafe { super::GetWindowThreadProcessId(super::hwnd(w), &mut pid) }; (pid, t) }
+        const IDLE: Duration = Duration::from_secs(10);
+        fn worker(tid: u32, w: W) {
+            let w2 = w.clone();
+            work(&w, IDLE, run, move || {
+                let mut m = workers().lock().unwrap();
+                let mut g = w2.0.lock().unwrap();
+                if g.len() > 0 { g.stop = false; return false }
+                if m.get(&tid).is_some_and(|x| Arc::ptr_eq(x, &w2)) { m.remove(&tid); }
+                true
+            });
+        }
+        fn run(j: Job) {
+            let h = super::hwnd(j.hwnd);
+            let ok = unsafe { super::IsWindow(h) != 0 };
+            let (pid, _) = if ok { owner(j.hwnd) } else { (0, 0) };
+            if !still_ours(&j, ok, pid, true) { return }
+            unsafe { super::SetWindowPos(h, super::hwnd(j.after), j.x, j.y, j.w, j.h, j.flags); }
+        }
+        pub fn set_pos(w: u64, r: super::R) {
+            let (pid, tid) = owner(w);
+            let flags = super::SWP_NOZORDER | super::SWP_NOACTIVATE | super::SWP_ASYNCWINDOWPOS;
+            if tid == 0 || tid == unsafe { super::GetCurrentThreadId() } {
+                unsafe { super::SetWindowPos(super::hwnd(w), std::ptr::null_mut(), r.x, r.y, r.w.max(1), r.h.max(1), flags); }
+                return;
+            }
+            let mut m = workers().lock().unwrap();
+            let wk = m.entry(tid).or_insert_with(|| {
+                let wk: W = Arc::new((Mutex::new(Q::default()), Condvar::new()));
+                let wk2 = wk.clone();
+                let _ = std::thread::Builder::new().name("cef-placer".into()).spawn(move || worker(tid, wk2));
+                wk
+            }).clone();
+            wk.0.lock().unwrap().push(Job { hwnd: w, after: 0, x: r.x, y: r.y, w: r.w.max(1), h: r.h.max(1), flags, pid, parent: 0, seq: 0 });
+            wk.1.notify_one();
+        }
+        pub fn cancel(w: u64) { for wk in workers().lock().unwrap().values() { wk.0.lock().unwrap().cancel(w); } }
+    }
+
+    /// Off-UI-thread host SetFocus worker (reusing native_child::focusq) so handing focus back from Chromium
+    /// never blocks GPUI's Win32 UI thread while Chromium's UI thread is busy.
+    mod focuser {
+        use crate::viewers::cef_focus::cef_child_thread_alive;
+        use crate::viewers::native_child::focusq::{Q, To};
+        use std::{sync::{Condvar, Mutex, OnceLock}, time::{Duration, Instant}};
+        use super::GUITHREADINFO;
+        fn st() -> &'static (Mutex<Q>, Condvar) { static S: OnceLock<(Mutex<Q>, Condvar)> = OnceLock::new(); S.get_or_init(Default::default) }
+        const IDLE: Duration = Duration::from_secs(10);
+        pub fn cef(target: u64) {
+            let mut pid = 0u32;
+            if target != 0 { unsafe { super::GetWindowThreadProcessId(super::hwnd(target), &mut pid); } }
+            let (q, cv) = st();
+            q.lock().unwrap().ask(To::Kicad { target, pid }, Instant::now());
+            cv.notify_all();
+        }
+        pub fn ours(w: u64, ui: u32) {
+            let (q, cv) = st();
+            let spawn = q.lock().unwrap().ask(To::Ours { window: w, activate: false }, Instant::now());
+            if let Some(era) = spawn {
+                let _ = std::thread::Builder::new().name("cef-focus".into()).spawn(move || worker(era, ui));
+            }
+            cv.notify_all();
+        }
+        fn worker(era: u64, ui: u32) {
+            let (q, cv) = st();
+            loop {
+                let job = {
+                    let mut g = q.lock().unwrap();
+                    loop {
+                        if g.era != era { break None }
+                        if let Some(j) = g.take(era, Instant::now()) { break Some(j) }
+                        let (ng, to) = cv.wait_timeout(g, IDLE).unwrap(); g = ng;
+                        if to.timed_out() && g.era == era && g.latest.is_some_and(|(s, x)| !matches!(x, To::Ours { .. }) || s <= g.taken) {
+                            g.ended(era);
+                            return;
+                        }
+                    }
+                };
+                let Some((seq, w, _)) = job else { q.lock().unwrap().ended(era); return };
+                let ours = unsafe { apply(w, ui) };
+                let r = {
+                    let mut g = q.lock().unwrap();
+                    let r = g.returned(era, seq, ours);
+                    if let Some((t, cpid)) = r.hand_in {
+                        let h = super::hwnd(t);
+                        let mut pid = 0u32;
+                        let tid = unsafe { super::GetWindowThreadProcessId(h, &mut pid) };
+                        if cef_child_thread_alive(unsafe { super::IsWindow(h) } != 0, pid, cpid, tid, ui) {
+                            unsafe { super::PostMessageW(h, super::WM_ACTIVATE, 1, 0); }
+                        }
+                    }
+                    r
+                };
+                if r.again { cv.notify_all(); }
+            }
+        }
+        unsafe fn apply(w: u64, ui: u32) -> bool {
+            let h = super::hwnd(w);
+            if unsafe { super::IsWindow(h) } == 0 { return true }
+            let me = unsafe { super::GetCurrentThreadId() };
+            let joined = unsafe { super::AttachThreadInput(me, ui, 1) } != 0;
+            if joined { unsafe { super::SetFocus(h); } }
+            let mut gti = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+            let focus_tid = if unsafe { super::GetGUIThreadInfo(0, &mut gti) } != 0 && !gti.hwndFocus.is_null() {
+                unsafe { super::GetWindowThreadProcessId(gti.hwndFocus, std::ptr::null_mut()) }
+            } else { 0 };
+            if joined { unsafe { super::AttachThreadInput(me, ui, 0); } }
+            focus_tid == 0 || focus_tid == ui
+        }
+    }
+
     pub fn close(w: u64) {
         unwatch_native(w);
+        placer::cancel(w);
         unsafe { DestroyWindow(hwnd(w)); }
     }
 
@@ -877,11 +997,14 @@ mod imp {
     }
 
     fn hwnd(w: u64) -> HWND { w as isize as HWND }
-    /// Asynchronous: the child belongs to CEF's UI thread, and a synchronous call from here would wait on it.
-    pub fn place(w: u64, r: R) { unsafe { SetWindowPos(hwnd(w), std::ptr::null_mut(), r.x, r.y, r.w.max(1), r.h.max(1), SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS); } }
-    pub fn show(w: u64, on: bool) { unsafe { ShowWindowAsync(hwnd(w), if on { SW_SHOWNA } else { SW_HIDE }); } }
-    /// CEF's SetFocus does it on Windows (its UI thread owns the child); nothing more here.
-    pub fn focus_child(_w: u64) {}
+    /// Offloaded to a worker queue per CEF UI thread (`native_child::placeq`), never stalling GPUI's UI thread.
+    pub fn place(w: u64, r: R) { placer::set_pos(w, r); }
+    pub fn show(w: u64, on: bool) {
+        if !on { placer::cancel(w); }
+        unsafe { ShowWindowAsync(hwnd(w), if on { SW_SHOWNA } else { SW_HIDE }); }
+    }
+    /// CEF's SetFocus does it on Windows; tell `focuser` so any in-flight host hand-back does not pull focus away.
+    pub fn focus_child(w: u64) { focuser::cef(w); }
     /// The client's window is gpui's, on this (its) thread.
     /// When `target != 0`, only returns Win32 focus to the host if `target` (or a child of `target`)
     /// currently holds foreground keyboard focus, so a background tab yank never steals from an active tab.
@@ -895,7 +1018,7 @@ mod imp {
                     return;
                 }
             }
-            unsafe { SetFocus(p as HWND); }
+            focuser::ours(p as u64, unsafe { GetCurrentThreadId() });
         }
     }
     pub fn geometry(w: u64) -> Option<(R, bool)> {

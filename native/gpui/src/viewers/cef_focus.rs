@@ -949,9 +949,23 @@ impl FocusHandoff {
     }
 }
 
+/// Returns whether a native child HWND belongs to the expected process and a non-host UI thread.
+pub fn cef_child_thread_alive(alive: bool, pid: u32, want_pid: u32, tid: u32, host_tid: u32) -> bool {
+    alive && pid != 0 && pid == want_pid && tid != 0 && tid != host_tid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cef_child_thread_check_accepts_same_process_other_ui_thread_only() {
+        assert!(cef_child_thread_alive(true, 42, 42, 200, 100));
+        assert!(!cef_child_thread_alive(false, 42, 42, 200, 100));
+        assert!(!cef_child_thread_alive(true, 99, 42, 200, 100));
+        assert!(!cef_child_thread_alive(true, 42, 42, 100, 100));
+        assert!(!cef_child_thread_alive(true, 42, 42, 0, 100));
+    }
 
     #[test]
     fn got_focus_alone_after_press_release_hands_focus_to_page_without_yank() {

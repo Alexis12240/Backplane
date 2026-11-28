@@ -411,6 +411,8 @@ static ENGINE: OnceLock<Result<Engine, String>> = OnceLock::new();
 fn free_port() -> u16 { std::net::TcpListener::bind("127.0.0.1:0").ok().and_then(|l| l.local_addr().ok()).map(|a| a.port()).unwrap_or(9333) }
 
 impl Engine {
+    /// Returns the initialized engine without starting it, if startup has already finished.
+    pub fn try_get() -> Option<&'static Result<Engine, String>> { ENGINE.get() }
     /// Starts CEF once for the process; Err (said in the page, which then falls back to the hub's frames) when the runtime is missing or CEF refuses.
     pub fn get() -> &'static Result<Engine, String> { ENGINE.get_or_init(Engine::start) }
     fn start() -> Result<Engine, String> {
@@ -557,8 +559,10 @@ impl Tab {
         // a new size: how long until Chromium's own widget has it (the e2e's resize measure, windowed)
         if let (Some(r), true) = (r, w != 0) { let mut last = self.placed_size.lock().unwrap();
             if *last != (r.w, r.h) { let first = *last == (0, 0); *last = (r.w, r.h); if first { return self.place_now(w, Some(r)) }
-                let (t0, done, want) = (std::time::Instant::now(), self.resize_ms_cell(), (r.w, r.h));
-                std::thread::spawn(move || { while t0.elapsed().as_secs() < 2 { if native::inner_size(w) == Some(want) { *done.lock().unwrap() = t0.elapsed().as_secs_f64() * 1e3; return } std::thread::sleep(std::time::Duration::from_millis(1)); } }); } }
+                if cfg!(target_os = "linux") {
+                    let (t0, done, want) = (std::time::Instant::now(), self.resize_ms_cell(), (r.w, r.h));
+                    std::thread::spawn(move || { while t0.elapsed().as_secs() < 2 { if native::inner_size(w) == Some(want) { *done.lock().unwrap() = t0.elapsed().as_secs_f64() * 1e3; return } std::thread::sleep(std::time::Duration::from_millis(1)); } });
+                } } }
         self.place_now(w, r)
     }
     fn place_now(&self, w: u64, r: Option<native::R>) {
